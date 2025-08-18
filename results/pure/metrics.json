@@ -6,17 +6,33 @@
   },
   "data": {
     "split": "validation",
-    "max_queries": 20,
-    "n_queries": 20,
-    "total_pairs": 200
+    "max_queries": 5,
+    "n_queries": 5,
+    "total_pairs": 50
   },
   "metrics": {
-    "P@10": 0.049999999999999996,
-    "R@10": 0.45,
-    "MRR@10": 0.14333333333333337,
-    "nDCG@10": 0.21469541543771986
+    "P@1": 0.0,
+    "P@10": 0.06000000000000001,
+    "R@10": 0.4,
+    "MRR@10": 0.13333333333333333,
+    "nDCG@10": 0.1855271382244264,
+    "nDCG@100": 0.1855271382244264,
+    "MAP@100": 0.10555555555555556
   },
-  "timing_sec": 8.352649927139282,
+  "timing_sec": 9.264438152313232,
   "semantic_sample_rate": 0.0,
-  "allow_token_duplicates": 2
+  "top_r": 200,
+  "params": {
+    "ALPHA": 0.5,
+    "BETA": 1.2,
+    "GAMMA": 1.8,
+    "DELTA": 0.6,
+    "DF_THRESH": 0.8,
+    "IDF_MIN": 0.1,
+    "MAX_EXPANDED": 8,
+    "MAX_MUST": 3,
+    "EXPANDED_WEIGHT": 0.4,
+    "MUST_WEIGHT": 0.2,
+    "DELTA_PRE": 0.3
+  }
 }

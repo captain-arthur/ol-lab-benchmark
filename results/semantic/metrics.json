@@ -1,101 +1,43 @@
 {
-  "model": "BM25 (+semantic expansion)",
+  "model": "BM25 (+semantic rerank)",
   "bm25_params": {
     "k1": 1.5,
     "b": 0.75
   },
   "data": {
     "split": "validation",
-    "max_queries": 20,
-    "n_queries": 20,
-    "total_pairs": 200
+    "max_queries": 5,
+    "n_queries": 5,
+    "total_pairs": 50
   },
   "metrics": {
-    "P@10": 0.0489484126984127,
+    "P@1": 0.2,
+    "P@10": 0.06000000000000001,
     "R@10": 0.4,
-    "MRR@10": 0.2625,
-    "nDCG@10": 0.29678903800158196,
-    "semantic_debug": {
-      "sem_attempted": 20,
-      "sem_applied": 20,
-      "avg_added_tokens": 24.5,
-      "random_seed": 8328,
-      "expanded_keywords_samples": [
-        [
-          "corporation",
-          "company",
-          "business structure"
-        ],
-        [
-          "Rachel Carson",
-          "Silent Spring",
-          "environmentalism",
-          "endocrine disruption",
-          "obligation to endure"
-        ],
-        [
-          "Progressive Movement",
-          "racial equality",
-          "social justice"
-        ],
-        [
-          "police forensic science",
-          "law enforcement forensics",
-          "crime scene investigation"
-        ],
-        [
-          "owls eating habits",
-          "owl diet",
-          "nocturnal feeding"
-        ]
-      ],
-      "must_include_samples": [
-        [
-          "corporation",
-          "company"
-        ],
-        [
-          "Rachel Carson",
-          "Silent Spring"
-        ],
-        [
-          "Progressive Movement",
-          "racial equality",
-          "discrimination"
-        ],
-        [
-          "police",
-          "forensic science",
-          "investigation"
-        ],
-        [
-          "owls",
-          "diet",
-          "eating"
-        ]
-      ],
-      "forbidden_terms_samples": [
-        [
-          "fiction",
-          "poetry"
-        ],
-        [
-          "climate change",
-          "sports"
-        ],
-        [
-          "medical",
-          "healthcare",
-          "doctor"
-        ],
-        [
-          "cats",
-          "dogs"
-        ]
-      ]
-    }
+    "MRR@10": 0.3,
+    "nDCG@10": 0.314285700802822,
+    "nDCG@100": 0.314285700802822,
+    "MAP@100": 0.27222222222222225
   },
-  "timing_sec": 257.8553080558777,
+  "timing_sec": 4.879096031188965,
   "semantic_sample_rate": 1.0,
-  "allow_token_duplicates": 2
+  "top_r": 400,
+  "params": {
+    "ALPHA": 0.5,
+    "BETA": 1.2,
+    "GAMMA": 1.8,
+    "DELTA": 0.6,
+    "DF_THRESH": 0.8,
+    "IDF_MIN": 0.1,
+    "MAX_EXPANDED": 8,
+    "MAX_MUST": 3,
+    "EXPANDED_WEIGHT": 0.4,
+    "MUST_WEIGHT": 0.2,
+    "DELTA_PRE": 0.3
+  },
+  "semantic_debug": {
+    "sem_attempted": 5,
+    "sem_applied": 5,
+    "skipped_by_dfidf": 0
+  }
 }

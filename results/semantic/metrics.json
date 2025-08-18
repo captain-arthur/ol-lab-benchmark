@@ -1,0 +1,101 @@
+{
+  "model": "BM25 (+semantic expansion)",
+  "bm25_params": {
+    "k1": 1.5,
+    "b": 0.75
+  },
+  "data": {
+    "split": "validation",
+    "max_queries": 20,
+    "n_queries": 20,
+    "total_pairs": 200
+  },
+  "metrics": {
+    "P@10": 0.0489484126984127,
+    "R@10": 0.4,
+    "MRR@10": 0.2625,
+    "nDCG@10": 0.29678903800158196,
+    "semantic_debug": {
+      "sem_attempted": 20,
+      "sem_applied": 20,
+      "avg_added_tokens": 24.5,
+      "random_seed": 8328,
+      "expanded_keywords_samples": [
+        [
+          "corporation",
+          "company",
+          "business structure"
+        ],
+        [
+          "Rachel Carson",
+          "Silent Spring",
+          "environmentalism",
+          "endocrine disruption",
+          "obligation to endure"
+        ],
+        [
+          "Progressive Movement",
+          "racial equality",
+          "social justice"
+        ],
+        [
+          "police forensic science",
+          "law enforcement forensics",
+          "crime scene investigation"
+        ],
+        [
+          "owls eating habits",
+          "owl diet",
+          "nocturnal feeding"
+        ]
+      ],
+      "must_include_samples": [
+        [
+          "corporation",
+          "company"
+        ],
+        [
+          "Rachel Carson",
+          "Silent Spring"
+        ],
+        [
+          "Progressive Movement",
+          "racial equality",
+          "discrimination"
+        ],
+        [
+          "police",
+          "forensic science",
+          "investigation"
+        ],
+        [
+          "owls",
+          "diet",
+          "eating"
+        ]
+      ],
+      "forbidden_terms_samples": [
+        [
+          "fiction",
+          "poetry"
+        ],
+        [
+          "climate change",
+          "sports"
+        ],
+        [
+          "medical",
+          "healthcare",
+          "doctor"
+        ],
+        [
+          "cats",
+          "dogs"
+        ]
+      ]
+    }
+  },
+  "timing_sec": 257.8553080558777,
+  "semantic_sample_rate": 1.0,
+  "allow_token_duplicates": 2
+}

@@ -1,0 +1,22 @@
+{
+  "model": "BM25 (pure)",
+  "bm25_params": {
+    "k1": 1.5,
+    "b": 0.75
+  },
+  "data": {
+    "split": "validation",
+    "max_queries": 20,
+    "n_queries": 20,
+    "total_pairs": 200
+  },
+  "metrics": {
+    "P@10": 0.049999999999999996,
+    "R@10": 0.45,
+    "MRR@10": 0.14333333333333337,
+    "nDCG@10": 0.21469541543771986
+  },
+  "timing_sec": 8.352649927139282,
+  "semantic_sample_rate": 0.0,
+  "allow_token_duplicates": 2
+}

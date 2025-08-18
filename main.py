@@ -4,7 +4,7 @@ import csv
 import re
 import math
 import time
-from typing import List, Dict, Any, Iterable, Tuple, Optional
+from typing import List, Dict, Any, Iterable, Tuple, Optional, Set
 
 import numpy as np
 from datasets import load_dataset
@@ -19,10 +19,41 @@ import requests
 EXPERIMENT_CONFIG = {
     "max_queries": 20,           # 기본값: 20, 최대 500,000까지 확장 가능
     "split": "validation",       # "validation" 또는 "train"
-    "semantic_sample_rate": 1.0, # 의미 확장 적용 비율 (0.0 ~ 1.0)
-    "allow_token_duplicates": 2, # 토큰 중복 허용 횟수 (1~2회 권장)
     "out_dir": "results"
 }
+
+# 환경변수로 실험 규모를 손쉽게 바꾸기 위한 오버라이드 (sanity check/배치 실행용)
+try:
+    EXPERIMENT_CONFIG["max_queries"] = int(os.getenv("OL_MAX_QUERIES", str(EXPERIMENT_CONFIG["max_queries"])))
+except Exception:
+    pass
+
+# --- Semantic rerank config --- [semantic-rerank]
+TOP_R_PURE = 200                # 순정 BM25 상위 후보 수
+TOP_R_SEM = 1000                # semantic BM25 상위 후보 수 - Recall↑ 위해 확장
+ALPHA = 0.5                    # expanded_keywords soft boost
+BETA  = 1.2                    # must_include soft boost (ALPHA보다 큼)
+GAMMA = 1.8                    # forbidden_terms soft penalty
+DELTA = 0.6                    # anchors(구절) 일치 보너스
+EXPANDED_WEIGHT = 0.4          # 확장 쿼리 가중합 계수 (Recall↑ 위해 상향)
+DF_THRESH = 0.80               # 확장 커버리지↑ 위해 완화 (노이즈는 EXPANDED_WEIGHT로 제어)
+IDF_MIN = 0.1                  # idf < IDF_MIN 이면 제거
+MAX_EXPANDED = 8               # expanded_keywords 상한
+MAX_MUST = 3                   # must_include 상한
+SEMANTIC_SAMPLE_RATE = 1.0     # 의미확장 적용 비율 (예: 0.5면 절반의 쿼리만)
+PHRASE_WINDOW = None           # 단순 substring 매칭이면 None
+MUST_WEIGHT = 0.2              # must_include 소프트 가중 (후보 선정 이전) - Recall↑ 위해 상향
+DELTA_PRE = 0.3                # anchors 사전 보너스 (후보 선정 이전)
+
+# 환경변수로 semantic 후보폭을 조절 (sanity check 시 축소 가능)
+try:
+    TOP_R_SEM = int(os.getenv("OL_TOP_R_SEM", str(TOP_R_SEM)))
+except Exception:
+    pass
+
+# BM25 파라미터 [semantic-rerank]
+K1 = 1.5
+B = 0.75
 
 
 # -----------------------------
@@ -31,31 +62,30 @@ EXPERIMENT_CONFIG = {
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
+def _key(q: str) -> str:
+    """캐시 키 정규화: 공백 정리 및 소문자화"""
+    return re.sub(r"\s+", " ", (q or "").strip().lower())
+
 def tokenize_en(text: str) -> List[str]:
     text = re.sub(r"[^\w\s]", " ", text.lower())
     toks = text.split()
     # 길이 2 이하 토큰은 잡음으로 제거
     return [t for t in toks if len(t) > 2]
 
-def normalize_tokens(tokens: List[str], allow_duplicates: int = 2) -> List[str]:
-    """
-    토큰 정규화: 중복 제거 및 정렬
-    allow_duplicates: 중복 허용 횟수 (1~2회 권장)
-    """
-    if not tokens:
-        return []
-    
-    # 토큰 빈도 계산
-    token_counts = {}
-    for token in tokens:
-        token_counts[token] = token_counts.get(token, 0) + 1
-    
-    # 중복 제거 (allow_duplicates 횟수만큼만 허용)
+def normalize_terms(terms: List[str]) -> List[str]:
+    """간단한 정규화: 소문자화 및 중복 제거"""
     normalized = []
-    for token, count in token_counts.items():
-        normalized.extend([token] * min(count, allow_duplicates))
-    
+    seen = set()
+    for term in terms:
+        term = term.lower().strip()
+        if term and term not in seen:
+            normalized.append(term)
+            seen.add(term)
     return normalized
+
+def dedup(terms: List[str]) -> List[str]:
+    """중복 제거"""
+    return list(dict.fromkeys(terms))
 
 def ndcg_at_k(ranked_rel: List[int], k: int = 10) -> float:
     k = min(k, len(ranked_rel))
@@ -76,14 +106,60 @@ def mrr_at_k(ranked_rel: List[int], k: int = 10) -> float:
             return 1.0 / (i + 1)
     return 0.0
 
+def map_at_k(ranked_rel: List[int], k: int = 100) -> float:
+    k = min(k, len(ranked_rel))
+    if sum(ranked_rel) == 0:
+        return 0.0
+    
+    precision_sum = 0.0
+    relevant_count = 0
+    
+    for i in range(k):
+        if ranked_rel[i] == 1:
+            relevant_count += 1
+            precision_sum += relevant_count / (i + 1)
+    
+    return precision_sum / sum(ranked_rel)
+
 
 # -----------------------------
-# Semantic expansion (Ollama gemma3)
+# Index/Statistics Preparation [semantic-rerank]
+# -----------------------------
+def build_idf_dict_from_df(df_dict: Dict[str, int], N: int) -> Dict[str, float]:
+    """DF 사전으로부터 BM25와 동일식으로 IDF 계산"""
+    idf_dict: Dict[str, float] = {}
+    for token, df in df_dict.items():
+        # BM25Okapi와 동일 공식
+        idf = math.log((N - df + 0.5) / (df + 0.5))
+        idf_dict[token] = idf
+    return idf_dict
+
+def build_doc_token_index(passages: List[str], tokenizer) -> Dict[int, Tuple[Set[str], str]]:
+    """문서 토큰셋/원문 캐시 구축"""
+    doc_index = {}
+    for doc_id, passage in enumerate(passages):
+        tokens = set(tokenizer(passage))
+        doc_index[doc_id] = (tokens, passage)
+    return doc_index
+
+def build_df_dict(passages: List[str], tokenizer) -> Dict[str, int]:
+    """문서 빈도(DF) 사전 구축"""
+    df_dict = {}
+    for passage in passages:
+        tokens = set(tokenizer(passage))
+        for token in tokens:
+            df_dict[token] = df_dict.get(token, 0) + 1
+    return df_dict
+
+
+# -----------------------------
+# Semantic Expansion (Ollama gemma3) [semantic-rerank]
 # -----------------------------
 def build_semantic_data_ollama(query: str,
                                host: str = "http://192.168.45.166:11434",
                                model: str = "gemma3",
-                               timeout: int = 20) -> Optional[Dict[str, Any]]:
+                               timeout: int = 15,
+                               retries: int = 2) -> Optional[Dict[str, Any]]:
     """
     Ollama 서버(gemma3)에 프롬프트를 보내 semantic_data 생성.
     반환 형식:
@@ -93,7 +169,8 @@ def build_semantic_data_ollama(query: str,
       "expanded": {
         "keywords": [...],
         "must_include": [...],
-        "forbidden_terms": [...]
+        "forbidden_terms": [...],
+        "anchors": [...]
       }
     }
     """
@@ -110,7 +187,8 @@ Example format:
   "expanded": {{
     "keywords": ["Federal Reserve interest rate changes", "US interest rate trends"],
     "must_include": ["interest rate", "Federal Reserve"],
-    "forbidden_terms": ["cryptocurrency","Bitcoin"]
+    "forbidden_terms": ["cryptocurrency","Bitcoin"],
+    "anchors": ["Federal Reserve", "interest rate changes"]
   }}
 }}
 
@@ -118,90 +196,70 @@ Now produce semantic_data for this query:
 "{query}"
 """.strip()
 
-    try:
-        # Ollama /api/generate
-        resp = requests.post(
-            f"{host}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        text = data.get("response", "").strip()
-        # 모델이 JSON만 반환하도록 프롬프트 했지만, 혹시 앞뒤 잡음 제거
-        first = text.find("{")
-        last = text.rfind("}")
-        if first == -1 or last == -1:
-            return None
-        json_text = text[first:last+1]
-        parsed = json.loads(json_text)
-        # 필드 정리 및 정규화
-        exp = parsed.get("expanded", {})
-        return {
-            "user_query": parsed.get("user_query", query),
-            "intent_data": parsed.get("intent_data", {"language": "en"}),
-            "expanded": {
-                "keywords": exp.get("keywords", []),
-                "must_include": exp.get("must_include", []),
-                "forbidden_terms": exp.get("forbidden_terms", [])
+    for attempt in range(retries + 1):
+        try:
+            # Ollama /api/generate (temperature=0으로 고정)
+            resp = requests.post(
+                f"{host}/api/generate",
+                json={"model": model, "prompt": prompt, "stream": False, "temperature": 0},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = data.get("response", "").strip()
+            # 모델이 JSON만 반환하도록 프롬프트 했지만, 혹시 앞뒤 잡음 제거
+            first = text.find("{")
+            last = text.rfind("}")
+            if first == -1 or last == -1:
+                return None
+            json_text = text[first:last+1]
+            parsed = json.loads(json_text)
+            # 필드 정리 및 정규화
+            exp = parsed.get("expanded", {})
+            return {
+                "user_query": parsed.get("user_query", query),
+                "intent_data": parsed.get("intent_data", {"language": "en"}),
+                "expanded": {
+                    "keywords": exp.get("keywords", []),
+                    "must_include": exp.get("must_include", []),
+                    "forbidden_terms": exp.get("forbidden_terms", []),
+                    "anchors": exp.get("anchors", [])
+                }
             }
-        }
-    except Exception:
-        return None
+        except Exception:
+            if attempt == retries:
+                return None
+            time.sleep(0.5 * (attempt + 1))  # 짧은 백오프
 
 
-def apply_semantic_to_query_tokens(base_tokens: List[str], sem: Optional[Dict[str, Any]], allow_duplicates: int = 2) -> Tuple[List[str], Dict[str, Any]]:
-    """
-    semantic_data를 쿼리 토큰에 반영:
-      - expanded.keywords: 토큰화 후 약한 가중(2배)로 추가
-      - must_include: 토큰화 후 강한 가중(3배)로 추가
-      - forbidden_terms: 쿼리 토큰엔 반영하지 않음(문서 필터링에서 적용)
-    
-    반환: (최종 토큰 리스트, 디버그 정보)
-    """
-    if not sem: 
-        return base_tokens, {"base_tokens": base_tokens, "added_tokens": [], "final_tokens": base_tokens}
-
-    exp = sem.get("expanded", {})
-    keywords = exp.get("keywords", [])
-    must_inc = exp.get("must_include", [])
-
-    tokens = list(base_tokens)
-    added_tokens = []
-
-    def add_weighted(tokens_src: List[str], weight: int):
-        nonlocal added_tokens
-        for s in tokens_src:
-            toks = tokenize_en(s)
-            added_tokens.extend(toks * weight)
-            tokens.extend(toks * weight)
-
-    add_weighted(keywords, 2)
-    add_weighted(must_inc, 3)
-
-    # 토큰 정규화 (중복 제거)
-    final_tokens = normalize_tokens(tokens, allow_duplicates)
-    
-    debug_info = {
-        "base_tokens": base_tokens,
-        "added_tokens": added_tokens,
-        "final_tokens": final_tokens,
-        "expanded_keywords": keywords,
-        "must_include": must_inc,
-        "forbidden_terms": exp.get("forbidden_terms", [])
-    }
-    
-    return final_tokens, debug_info
+def filter_semantic_terms(terms: List[str], df_dict: Dict[str, int], N: int, idf: Dict[str, float], is_must: bool = False) -> List[str]:
+    """의미확장 데이터 전처리 필터(DF/IDF) & 상한 적용 [semantic-rerank]"""
+    kept = []
+    for t in normalize_terms(terms):
+        if (df_dict.get(t, 0) / N) <= DF_THRESH and idf.get(t, 0.0) >= IDF_MIN:
+            kept.append(t)
+    limit = MAX_MUST if is_must else MAX_EXPANDED
+    return dedup(kept)[:limit]
 
 
-def passage_has_forbidden(passage: str, forbidden_terms: List[str]) -> bool:
-    if not forbidden_terms:
-        return False
-    p = passage.lower()
-    for t in forbidden_terms:
-        if t.lower() in p:
-            return True
-    return False
+def soft_semantic_score(doc_tokens: Set[str], doc_text: str, idf: Dict[str, float], 
+                       expanded: List[str], must_inc: List[str], forbid: List[str], anchors: List[str]) -> float:
+    """재랭크 점수식 구현 (중복 토큰 주입 금지) [semantic-rerank]"""
+    s = 0.0
+    for t in expanded:
+        if t in doc_tokens: 
+            s += ALPHA * idf.get(t, 0.0)
+    for t in must_inc:
+        if t in doc_tokens: 
+            s += BETA * idf.get(t, 0.0)
+    for t in forbid:
+        if t in doc_tokens: 
+            s -= GAMMA * idf.get(t, 0.0)
+    if anchors:
+        for ph in anchors:
+            if ph and ph.lower() in doc_text.lower():
+                s += DELTA
+    return s
 
 
 # -----------------------------
@@ -243,142 +301,201 @@ def iter_ms_marco_query_groups(split: str = "validation",
 
 
 # -----------------------------
-# BM25 evaluation (per-query group)
+# BM25 evaluation (per-query group) [semantic-rerank]
 # -----------------------------
-def score_group_bm25(query: str,
-                     passages: List[str],
-                     labels: List[int],
-                     semantic: bool,
-                     sem_data: Optional[Dict[str, Any]],
-                     allow_duplicates: int = 2) -> Tuple[List[int], List[float], List[int], Dict[str, Any]]:
+def score_group_bm25_rerank(query: str,
+                           passages: List[str],
+                           labels: List[int],
+                           semantic: bool,
+                           sem_data: Optional[Dict[str, Any]],
+                           df_dict: Dict[str, int],
+                           idf: Dict[str, float],
+                           doc_index: Dict[int, Tuple[Set[str], str]]) -> Tuple[List[int], List[float], List[int], Dict[str, Any]]:
     """
-    한 쿼리 그룹에 대해 BM25로 랭킹. (순정/의미 확장)
+    한 쿼리 그룹에 대해 BM25 + 재랭크로 랭킹. [semantic-rerank]
     반환:
       order: passage 인덱스의 랭킹 순서
       scores: 점수 배열 (passage 수)
-      filtered_labels: forbidden 필터링 후 labels (order와 같은 정렬 전에 원본 순서)
-      debug_info: 토큰 디버그 정보
+      labels: 원본 labels
+      debug_info: 디버그 정보
     """
-    # forbidden 필터링(문서 제거)
-    forbidden = (sem_data or {}).get("expanded", {}).get("forbidden_terms", []) if semantic else []
-    if forbidden:
-        mask = [not passage_has_forbidden(p, forbidden) for p in passages]
-        passages = [p for p, m in zip(passages, mask) if m]
-        labels   = [r for r, m in zip(labels,   mask) if m]
-        if not passages:  # 전부 필터링되면 빈 결과 반환
-            return [], [], [], {}
-
-    # BM25 인덱스 구성
+    N = len(passages)
+    
+    # 1차: 순정 BM25로 후보 뽑기 (semantic 여부에 따라 다른 TOP_R 적용)
     docs_tokens = [tokenize_en(p) for p in passages]
-    bm25 = BM25Okapi(docs_tokens, k1=1.5, b=0.75)
-
-    # 쿼리 토큰
+    bm25 = BM25Okapi(docs_tokens, k1=K1, b=B)
+    
+    # 쿼리 토큰 (순정 토크나이저 결과만 사용)
     q_tokens = tokenize_en(query)
-    debug_info = {}
-    if semantic:
-        q_tokens, debug_info = apply_semantic_to_query_tokens(q_tokens, sem_data, allow_duplicates)
+    base_scores = bm25.get_scores(q_tokens)
+    
+    # semantic 모드일 때만 확장 쿼리 가중합 적용
+    if semantic and sem_data:
+        exp = sem_data.get("expanded", {})
+        expanded = filter_semantic_terms(exp.get("keywords", []), df_dict, N, idf, False)
+        must_inc = filter_semantic_terms(exp.get("must_include", []), df_dict, N, idf, True)
+        forbidden = normalize_terms(exp.get("forbidden_terms", []))
+        anchors = normalize_terms(exp.get("anchors", []))
 
-    # 점수 및 랭킹
-    scores = bm25.get_scores(q_tokens)
-    order = list(range(len(scores)))
-    order.sort(key=lambda i: scores[i], reverse=True)
+        # 확장된 쿼리 생성 (중복 제거)
+        q_tokens_expanded = list(set(q_tokens + must_inc + expanded))
+        if q_tokens_expanded:
+            alt_scores = bm25.get_scores(q_tokens_expanded)
+            base_scores = [base + alt * EXPANDED_WEIGHT for base, alt in zip(base_scores, alt_scores)]
 
-    return order, list(scores), labels, debug_info
+        # must_include-only 보정(소프트) → 후보 선정 이전
+        if must_inc:
+            must_scores = bm25.get_scores(must_inc)
+            base_scores = [s + MUST_WEIGHT * ms for s, ms in zip(base_scores, must_scores)]
+
+        # anchors 사전 보너스(소프트) → 후보 선정 이전
+        if anchors:
+            low_anchors = [a for a in anchors if a]
+            if low_anchors:
+                for i, (_, doc_text) in doc_index.items():
+                    lt = doc_text.lower()
+                    if any(a in lt for a in low_anchors):
+                        base_scores[i] += DELTA_PRE
+    
+    # TOP_R 후보 추출 (semantic 여부에 따라 다름)
+    top_r = TOP_R_SEM if semantic else TOP_R_PURE
+    candidates = list(range(len(base_scores)))
+    candidates.sort(key=lambda i: base_scores[i], reverse=True)
+    top_candidates = candidates[:top_r]
+    
+    debug_info: Dict[str, Any] = {"semantic_applied": False, "filtered_terms": {}, "skipped_by_dfidf": False}
+    
+    # 2차: semantic=True이고 샘플링에 걸린 쿼리만 재랭크 적용
+    if semantic and sem_data:
+        # 위에서 계산한 expanded/must_inc/forbidden/anchors를 재사용
+        # (없다면 안전하게 다시 계산)
+        try:
+            expanded
+        except NameError:
+            exp = sem_data.get("expanded", {})
+            expanded = filter_semantic_terms(exp.get("keywords", []), df_dict, N, idf, False)
+            must_inc = filter_semantic_terms(exp.get("must_include", []), df_dict, N, idf, True)
+            forbidden = normalize_terms(exp.get("forbidden_terms", []))
+            anchors = normalize_terms(exp.get("anchors", []))
+        
+        debug_info["filtered_terms"] = {
+            "expanded": expanded,
+            "must_include": must_inc,
+            "forbidden": forbidden,
+            "anchors": anchors
+        }
+        
+        # DF/IDF 필터로 적용할 게 없으면 스킵
+        if not expanded and not must_inc and not anchors and not forbidden:
+            debug_info["skipped_by_dfidf"] = True
+        else:
+            debug_info["semantic_applied"] = True
+            # 각 후보 문서에 soft_semantic_score를 더해 재정렬 (하드 필터 아님)
+            reranked_candidates = []
+            for doc_id in top_candidates:
+                doc_tokens, doc_text = doc_index[doc_id]
+                semantic_bonus = soft_semantic_score(doc_tokens, doc_text, idf, expanded, must_inc, forbidden, anchors)
+                final_score = base_scores[doc_id] + semantic_bonus
+                reranked_candidates.append((doc_id, final_score))
+            
+            # 재랭크된 후보들 정렬
+            reranked_candidates.sort(key=lambda x: x[1], reverse=True)
+            top_candidates = [doc_id for doc_id, _ in reranked_candidates]
+    
+    # 재랭크 직후에 추가
+    final_score_map = {}
+    if semantic and sem_data and reranked_candidates:
+        final_score_map = {doc_id: s for doc_id, s in reranked_candidates}
+    
+    # 3차: 최종 top-100에서 메트릭 계산
+    final_order = top_candidates[:100]  # top-100으로 제한
+    # 최종 점수는 재랭크 점수 우선, 없으면 base_scores
+    final_scores = [
+        (final_score_map[i] if i in final_score_map else float(base_scores[i]))
+        for i in final_order
+    ]
+    final_labels = [labels[i] for i in final_order]
+    
+    return final_order, final_scores, final_labels, debug_info
 
 
 # -----------------------------
-# Metrics accumulator
+# Metrics accumulator [semantic-rerank]
 # -----------------------------
 class Metrics:
     def __init__(self):
         self.n = 0
+        self.sum_p1 = 0.0
         self.sum_p10 = 0.0
         self.sum_r10 = 0.0
         self.sum_mrr10 = 0.0
         self.sum_ndcg10 = 0.0
+        self.sum_ndcg100 = 0.0
+        self.sum_map100 = 0.0
         # semantic debug 정보
         self.sem_attempted = 0
         self.sem_applied = 0
-        self.total_added_tokens = 0
-        self.random_seed = None
-        # semantic_data 통계
-        self.expanded_keywords_samples = []
-        self.must_include_samples = []
-        self.forbidden_terms_samples = []
+        self.skipped_by_dfidf = 0
 
-    def add(self, ranked_labels: List[int], sem_used: bool = False, added_tokens: int = 0, 
-            expanded_keywords: List[str] = None, must_include: List[str] = None, forbidden_terms: List[str] = None):
+    def add(self, ranked_labels: List[int], total_rel_all: int, sem_applied: bool = False):
         self.n += 1
         topk = ranked_labels[:10]
-        total_rel = sum(ranked_labels)
+        # 주의: recall의 분모는 그룹 전체의 관련 문서 수여야 함
+        total_rel = max(int(total_rel_all), 0)
 
+        p1 = ranked_labels[0] if ranked_labels else 0.0
         p10 = (sum(topk) / max(len(topk), 1)) if topk else 0.0
         r10 = (sum(topk) / max(total_rel, 1)) if total_rel > 0 else 0.0
         mrr10 = mrr_at_k(ranked_labels, 10)
         ndcg10 = ndcg_at_k(ranked_labels, 10)
+        ndcg100 = ndcg_at_k(ranked_labels, 100)
+        map100 = map_at_k(ranked_labels, 100)
 
+        self.sum_p1 += p1
         self.sum_p10 += p10
         self.sum_r10 += r10
         self.sum_mrr10 += mrr10
         self.sum_ndcg10 += ndcg10
+        self.sum_ndcg100 += ndcg100
+        self.sum_map100 += map100
 
-        if sem_used:
+        if sem_applied:
             self.sem_applied += 1
-            self.total_added_tokens += added_tokens
-            
-            # semantic_data 샘플 저장 (처음 5개만)
-            if len(self.expanded_keywords_samples) < 5:
-                if expanded_keywords:
-                    self.expanded_keywords_samples.append(expanded_keywords)
-                if must_include:
-                    self.must_include_samples.append(must_include)
-                if forbidden_terms:
-                    self.forbidden_terms_samples.append(forbidden_terms)
 
     def add_sem_attempt(self):
         self.sem_attempted += 1
 
-    def set_random_seed(self, seed: int):
-        self.random_seed = seed
+    def add_skipped_by_dfidf(self):
+        self.skipped_by_dfidf += 1
 
-    def result(self) -> Dict[str, Any]:
+    def result(self) -> Dict[str, float]:
         if self.n == 0:
-            return {"P@10": 0.0, "R@10": 0.0, "MRR@10": 0.0, "nDCG@10": 0.0}
+            return {
+                "P@1": 0.0, "P@10": 0.0, "R@10": 0.0, "MRR@10": 0.0, 
+                "nDCG@10": 0.0, "nDCG@100": 0.0, "MAP@100": 0.0
+            }
         
-        result = {
+        return {
+            "P@1": self.sum_p1 / self.n,
             "P@10": self.sum_p10 / self.n,
             "R@10": self.sum_r10 / self.n,
             "MRR@10": self.sum_mrr10 / self.n,
             "nDCG@10": self.sum_ndcg10 / self.n,
+            "nDCG@100": self.sum_ndcg100 / self.n,
+            "MAP@100": self.sum_map100 / self.n,
         }
-        
-        # semantic debug 정보 추가
-        if self.sem_attempted > 0:
-            result["semantic_debug"] = {
-                "sem_attempted": self.sem_attempted,
-                "sem_applied": self.sem_applied,
-                "avg_added_tokens": self.total_added_tokens / max(self.sem_applied, 1),
-                "random_seed": self.random_seed,
-                "expanded_keywords_samples": self.expanded_keywords_samples,
-                "must_include_samples": self.must_include_samples,
-                "forbidden_terms_samples": self.forbidden_terms_samples
-            }
-        
-        return result
 
 
 # -----------------------------
-# Runner
+# Runner [semantic-rerank]
 # -----------------------------
 def run_benchmark(semantic: bool,
                   split: str = "validation",
                   max_queries: int = 20,
-                  sample_rate: float = 0.1,
-                  out_dir: str = "results",
-                  allow_duplicates: int = 2):
+                  out_dir: str = "results"):
     """
     semantic=False  → BM25 순정
-    semantic=True   → BM25 + 의미 확장(샘플링 비율로 Ollama 호출)
+    semantic=True   → BM25 + 의미 확장 재랭크
     """
     mode = "semantic" if semantic else "pure"
     save_dir = os.path.join(out_dir, mode)
@@ -389,8 +506,51 @@ def run_benchmark(semantic: bool,
     
     # semantic 데이터 저장 파일
     semantic_data_path = None
+    cache_path = None
+    cache: Dict[str, Any] = {}
+    hits = misses = 0
+    save_every = 20  # 20개마다 중간 저장
+    
     if semantic:
         semantic_data_path = os.path.join(save_dir, "semantic_data.jsonl")
+        # 캐시는 .cache 폴더에 저장
+        cache_dir = os.path.join(out_dir, ".cache")
+        ensure_dir(cache_dir)
+        cache_path = os.path.join(cache_dir, "ollama_cache.json")
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as cf:
+                    cache = json.load(cf)
+            except Exception:
+                cache = {}
+        
+        # semantic_data.jsonl → 캐시로 프리로드
+        if os.path.exists(semantic_data_path):
+            try:
+                with open(semantic_data_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        q = row.get("query", "")
+                        if not q:
+                            continue
+                        k = _key(q)
+                        if k not in cache:
+                            # jsonl에는 필터링된 필드만 있으니 캐시 구조에 맞춰 래핑
+                            cache[k] = {
+                                "user_query": q,
+                                "intent_data": {"language": "en"},
+                                "expanded": {
+                                    "keywords": row.get("expanded_keywords", []),
+                                    "must_include": row.get("must_include", []),
+                                    "forbidden_terms": row.get("forbidden_terms", []),
+                                    "anchors": row.get("anchors", []),
+                                }
+                            }
+            except Exception:
+                pass
 
     # CSV 헤더 기록
     with open(rankings_path, "w", newline="", encoding="utf-8") as f:
@@ -406,50 +566,66 @@ def run_benchmark(semantic: bool,
     # 랜덤 시드 설정 (재현성을 위해)
     random_seed = int(time.time()) % 10000
     np.random.seed(random_seed)
-    metrics.set_random_seed(random_seed)
 
     for q_idx, (query, passages, labels) in enumerate(iter_ms_marco_query_groups(split=split, max_queries=max_queries), start=1):
         n_queries += 1
         total_pairs += len(passages)
 
-        sem_data = None
-        sem_used = False
-        if semantic and (np.random.rand() < sample_rate):
-            metrics.add_sem_attempt()
-            sem_data = build_semantic_data_ollama(query)
-            if sem_data:
-                sem_used = True
+        # 통계/인덱스 준비
+        df_dict = build_df_dict(passages, tokenize_en)
+        idf = build_idf_dict_from_df(df_dict, len(passages))
+        doc_index = build_doc_token_index(passages, tokenize_en)
 
-        order, scores, filt_labels, debug_info = score_group_bm25(query, passages, labels, semantic, sem_data, allow_duplicates)
+        sem_data = None
+        debug_info: Dict[str, Any] = {}
+        if semantic and (np.random.rand() < SEMANTIC_SAMPLE_RATE):
+            metrics.add_sem_attempt()
+            # 캐시 우선 (정규화된 키 사용)
+            key = _key(query)
+            if key in cache:
+                hits += 1
+                sem_data = cache[key]
+            else:
+                misses += 1
+                sem_data = build_semantic_data_ollama(query)
+                if sem_data:
+                    cache[key] = sem_data
+
+        order, scores, final_labels, debug_info = score_group_bm25_rerank(
+            query, passages, labels, semantic, sem_data, df_dict, idf, doc_index
+        )
+        
         if not order:
-            # 기록할 것이 없으면 다음 쿼리로
             continue
 
-        # 평가용 라벨(랭킹 순서대로)
-        ranked_labels = [filt_labels[i] for i in order]
-        
         # semantic 데이터 저장
         if semantic and semantic_data_path and sem_data:
+            filtered = debug_info.get("filtered_terms", {})
             semantic_entry = {
                 "qid": q_idx,
                 "query": query,
-                "expanded_keywords": sem_data.get("expanded", {}).get("keywords", []),
-                "must_include": sem_data.get("expanded", {}).get("must_include", []),
-                "forbidden_terms": sem_data.get("expanded", {}).get("forbidden_terms", []),
-                "final_tokens": debug_info.get("final_tokens", [])
+                "expanded_keywords": filtered.get("expanded", []),
+                "must_include": filtered.get("must_include", []),
+                "forbidden_terms": filtered.get("forbidden", []),
+                "anchors": filtered.get("anchors", [])
             }
             with open(semantic_data_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(semantic_entry, ensure_ascii=False) + "\n")
 
-        # 메트릭 추가
-        added_tokens = len(debug_info.get("added_tokens", []))
-        expanded_keywords = debug_info.get("expanded_keywords", [])
-        must_include = debug_info.get("must_include", [])
-        forbidden_terms = debug_info.get("forbidden_terms", [])
-        
-        metrics.add(ranked_labels, sem_used, added_tokens, expanded_keywords, must_include, forbidden_terms)
+        # 메트릭 추가 및 스킵 집계
+        if debug_info.get("skipped_by_dfidf"):
+            metrics.add_skipped_by_dfidf()
+        metrics.add(final_labels, total_rel_all=sum(labels), sem_applied=debug_info.get("semantic_applied", False))
 
-        # 상위 10개만 CSV 기록 (논문 부록 크기 조절용; 원하면 모두 쓰세요)
+        # 중간 저장 (주기적으로)
+        if semantic and (q_idx % save_every == 0) and cache_path is not None:
+            try:
+                with open(cache_path, "w", encoding="utf-8") as cf:
+                    json.dump(cache, cf, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        # 상위 10개만 CSV 기록
         topN = min(10, len(order))
         with open(rankings_path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -458,31 +634,26 @@ def run_benchmark(semantic: bool,
                 w.writerow([
                     query,
                     r + 1,
-                    float(scores[idx]),
-                    int(filt_labels[idx]),
+                    float(scores[r]),
+                    int(final_labels[r]),
                     idx,
                     passages[idx].replace("\n", " ").strip()
                 ])
 
-        # 개선된 로그 (샘플 3개 쿼리만)
+        # 간단 로그 (샘플 3개 쿼리만)
         if q_idx <= 3:
-            base_tokens = debug_info.get("base_tokens", [])
-            added_tokens_list = debug_info.get("added_tokens", [])
-            final_tokens = debug_info.get("final_tokens", [])
-            
-            print(f"[{mode}] Q{q_idx} query='{query[:60]}'")
-            print(f"  base   : {base_tokens}")
-            print(f"  added  : {added_tokens_list}")
-            print(f"  tokens : {len(final_tokens)} (base={len(base_tokens)}, added={len(added_tokens_list)})")
-            print(f"  sem_used={'Y' if sem_used else 'N'}")
+            sem_used = 'Y' if debug_info.get("semantic_applied", False) else ('-' if not sem_data else 'N')
+            print(f"[{mode}] Q{q_idx} query='{query[:60]}' sem_used={sem_used} "
+                  f"top_r={TOP_R_SEM if semantic else TOP_R_PURE} "
+                  f"w_exp={EXPANDED_WEIGHT} w_must={MUST_WEIGHT}")
 
     elapsed = time.time() - t0
     result_metrics = metrics.result()
 
-    # 메타/메트릭 저장
+    # 메타/메트릭 저장 (샘플 문자열 제거)
     meta = {
-        "model": "BM25 (+semantic expansion)" if semantic else "BM25 (pure)",
-        "bm25_params": {"k1": 1.5, "b": 0.75},
+        "model": "BM25 (+semantic rerank)" if semantic else "BM25 (pure)",
+        "bm25_params": {"k1": K1, "b": B},
         "data": {
             "split": split,
             "max_queries": max_queries,
@@ -491,52 +662,79 @@ def run_benchmark(semantic: bool,
         },
         "metrics": result_metrics,
         "timing_sec": elapsed,
-        "semantic_sample_rate": sample_rate if semantic else 0.0,
-        "allow_token_duplicates": allow_duplicates
+        "semantic_sample_rate": SEMANTIC_SAMPLE_RATE if semantic else 0.0,
+        "top_r": TOP_R_SEM if semantic else TOP_R_PURE,
+        "params": {
+            "ALPHA": ALPHA,
+            "BETA": BETA,
+            "GAMMA": GAMMA,
+            "DELTA": DELTA,
+            "DF_THRESH": DF_THRESH,
+            "IDF_MIN": IDF_MIN,
+            "MAX_EXPANDED": MAX_EXPANDED,
+            "MAX_MUST": MAX_MUST,
+            "EXPANDED_WEIGHT": EXPANDED_WEIGHT,
+            "MUST_WEIGHT": MUST_WEIGHT,
+            "DELTA_PRE": DELTA_PRE
+        }
     }
+    
+    # semantic debug 정보 추가 (숫자만)
+    if semantic and (metrics.sem_attempted > 0 or metrics.sem_applied > 0 or metrics.skipped_by_dfidf > 0):
+        meta["semantic_debug"] = {
+            "sem_attempted": metrics.sem_attempted,
+            "sem_applied": metrics.sem_applied,
+            "skipped_by_dfidf": metrics.skipped_by_dfidf
+        }
+    
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print(f"\n[{mode}] done.  n_queries={n_queries}, total_pairs={total_pairs}, "
-          f"P@10={result_metrics['P@10']:.3f}, R@10={result_metrics['R@10']:.3f}, "
-          f"MRR@10={result_metrics['MRR@10']:.3f}, nDCG@10={result_metrics['nDCG@10']:.3f}, "
-          f"time={elapsed:.1f}s")
+    # 캐시 저장
+    if semantic and cache_path is not None:
+        try:
+            with open(cache_path, "w", encoding="utf-8") as cf:
+                json.dump(cache, cf, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    # 콘솔 요약 (간단)
+    print(f"\n[{mode}] done.  n_queries={n_queries}, total_pairs={total_pairs}")
+    print(f"  P@1={result_metrics['P@1']:.3f}, P@10={result_metrics['P@10']:.3f}, MRR@10={result_metrics['MRR@10']:.3f}")
+    print(f"  nDCG@10={result_metrics['nDCG@10']:.3f}, R@10={result_metrics['R@10']:.3f}, time={elapsed:.1f}s")
+    if semantic:
+        dbg = meta.get("semantic_debug", {"sem_applied":0, "sem_attempted":0, "skipped_by_dfidf":0})
+        print(f"  sem_applied={dbg['sem_applied']}/{dbg['sem_attempted']}, skipped_by_dfidf={dbg['skipped_by_dfidf']}")
+        print(f"  cache_hits={hits}, cache_misses={misses}, cache_size={len(cache)}")
     print(f" - Rankings: {rankings_path}")
     print(f" - Metrics : {metrics_path}")
-    if semantic_data_path:
+    if semantic and semantic_data_path:
         print(f" - Semantic: {semantic_data_path}")
     
-    return result_metrics
+    return meta
 
 
 def print_comparison_summary(pure_metrics: Dict[str, Any], semantic_metrics: Dict[str, Any]):
-    """Pure vs Semantic 모델 비교 요약 출력"""
+    """Pure vs Semantic 모델 비교 요약 출력 [semantic-rerank]"""
     print("\n" + "="*60)
     print("PURE vs SEMANTIC COMPARISON SUMMARY")
     print("="*60)
     
-    # metrics 구조 확인 및 수정
-    if "metrics" in pure_metrics:
-        pure_scores = pure_metrics["metrics"]
-    else:
-        pure_scores = pure_metrics
+    pure_scores = pure_metrics.get("metrics", pure_metrics)
+    sem_scores = semantic_metrics.get("metrics", semantic_metrics)
     
-    if "metrics" in semantic_metrics:
-        sem_scores = semantic_metrics["metrics"]
-    else:
-        sem_scores = semantic_metrics
-    
+    print(f"P@1     : {pure_scores['P@1']:.3f} → {sem_scores['P@1']:.3f} ({'↑' if sem_scores['P@1'] > pure_scores['P@1'] else '↓'}{abs(sem_scores['P@1'] - pure_scores['P@1']):.3f})")
     print(f"P@10    : {pure_scores['P@10']:.3f} → {sem_scores['P@10']:.3f} ({'↑' if sem_scores['P@10'] > pure_scores['P@10'] else '↓'}{abs(sem_scores['P@10'] - pure_scores['P@10']):.3f})")
-    print(f"R@10    : {pure_scores['R@10']:.3f} → {sem_scores['R@10']:.3f} ({'↑' if sem_scores['R@10'] > pure_scores['R@10'] else '↓'}{abs(sem_scores['R@10'] - pure_scores['R@10']):.3f})")
     print(f"MRR@10  : {pure_scores['MRR@10']:.3f} → {sem_scores['MRR@10']:.3f} ({'↑' if sem_scores['MRR@10'] > pure_scores['MRR@10'] else '↓'}{abs(sem_scores['MRR@10'] - pure_scores['MRR@10']):.3f})")
     print(f"nDCG@10 : {pure_scores['nDCG@10']:.3f} → {sem_scores['nDCG@10']:.3f} ({'↑' if sem_scores['nDCG@10'] > pure_scores['nDCG@10'] else '↓'}{abs(sem_scores['nDCG@10'] - pure_scores['nDCG@10']):.3f})")
+    print(f"R@10    : {pure_scores['R@10']:.3f} → {sem_scores['R@10']:.3f} ({'↑' if sem_scores['R@10'] > pure_scores['R@10'] else '↓'}{abs(sem_scores['R@10'] - pure_scores['R@10']):.3f})")
     
-    if "semantic_debug" in sem_scores:
-        debug = sem_scores["semantic_debug"]
-        print(f"\nSemantic Expansion Stats:")
+    if "semantic_debug" in semantic_metrics:
+        debug = semantic_metrics["semantic_debug"]
+        print(f"\nSemantic Rerank Stats:")
         print(f"  - Attempted: {debug['sem_attempted']}")
         print(f"  - Applied: {debug['sem_applied']}")
-        print(f"  - Avg Added Tokens: {debug['avg_added_tokens']:.1f}")
+        print(f"  - Skipped by DF/IDF: {debug['skipped_by_dfidf']}")
     
     print("="*60)
 
@@ -554,19 +752,16 @@ if __name__ == "__main__":
         semantic=False, 
         split=config["split"], 
         max_queries=config["max_queries"], 
-        out_dir=config["out_dir"],
-        allow_duplicates=config["allow_token_duplicates"]
+        out_dir=config["out_dir"]
     )
 
-    # 2) 의미 확장 BM25
-    print("\nRunning Semantic BM25...")
+    # 2) 의미 확장 BM25 (재랭크)
+    print("\nRunning Semantic BM25 (Rerank)...")
     semantic_metrics = run_benchmark(
         semantic=True, 
         split=config["split"], 
         max_queries=config["max_queries"], 
-        sample_rate=config["semantic_sample_rate"], 
-        out_dir=config["out_dir"],
-        allow_duplicates=config["allow_token_duplicates"]
+        out_dir=config["out_dir"]
     )
     
     # 3) 비교 요약 출력
@@ -575,4 +770,4 @@ if __name__ == "__main__":
     # (본실험) config 수정 후 실행
     # EXPERIMENT_CONFIG["max_queries"] = 500000
     # EXPERIMENT_CONFIG["split"] = "train"
-    # EXPERIMENT_CONFIG["semantic_sample_rate"] = 0.05
+    # SEMANTIC_SAMPLE_RATE = 0.05

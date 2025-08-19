@@ -19,7 +19,7 @@ import requests
 EXPERIMENT_CONFIG = {
     "max_queries": 20,           # 기본값: 20, 최대 500,000까지 확장 가능
     "split": "validation",       # "validation" 또는 "train"
-    "out_dir": "results"
+    "out_dir": "results/ms_marco"
 }
 
 # 환경변수로 실험 규모를 손쉽게 바꾸기 위한 오버라이드 (sanity check/배치 실행용)
@@ -34,7 +34,7 @@ TOP_R_SEM = 1000                # semantic BM25 상위 후보 수 - Recall↑ �
 ALPHA = 0.5                    # expanded_keywords soft boost
 BETA  = 1.2                    # must_include soft boost (ALPHA보다 큼)
 GAMMA = 1.8                    # forbidden_terms soft penalty
-DELTA = 0.6                    # anchors(구절) 일치 보너스
+
 EXPANDED_WEIGHT = 0.4          # 확장 쿼리 가중합 계수 (Recall↑ 위해 상향)
 DF_THRESH = 0.80               # 확장 커버리지↑ 위해 완화 (노이즈는 EXPANDED_WEIGHT로 제어)
 IDF_MIN = 0.1                  # idf < IDF_MIN 이면 제거
@@ -43,7 +43,7 @@ MAX_MUST = 3                   # must_include 상한
 SEMANTIC_SAMPLE_RATE = 1.0     # 의미확장 적용 비율 (예: 0.5면 절반의 쿼리만)
 PHRASE_WINDOW = None           # 단순 substring 매칭이면 None
 MUST_WEIGHT = 0.2              # must_include 소프트 가중 (후보 선정 이전) - Recall↑ 위해 상향
-DELTA_PRE = 0.3                # anchors 사전 보너스 (후보 선정 이전)
+
 
 # 환경변수로 semantic 후보폭을 조절 (sanity check 시 축소 가능)
 try:
@@ -170,7 +170,7 @@ def build_semantic_data_ollama(query: str,
         "keywords": [...],
         "must_include": [...],
         "forbidden_terms": [...],
-        "anchors": [...]
+    
       }
     }
     """
@@ -188,7 +188,7 @@ Example format:
     "keywords": ["Federal Reserve interest rate changes", "US interest rate trends"],
     "must_include": ["interest rate", "Federal Reserve"],
     "forbidden_terms": ["cryptocurrency","Bitcoin"],
-    "anchors": ["Federal Reserve", "interest rate changes"]
+
   }}
 }}
 
@@ -223,7 +223,7 @@ Now produce semantic_data for this query:
                     "keywords": exp.get("keywords", []),
                     "must_include": exp.get("must_include", []),
                     "forbidden_terms": exp.get("forbidden_terms", []),
-                    "anchors": exp.get("anchors", [])
+                
                 }
             }
         except Exception:
@@ -243,7 +243,7 @@ def filter_semantic_terms(terms: List[str], df_dict: Dict[str, int], N: int, idf
 
 
 def soft_semantic_score(doc_tokens: Set[str], doc_text: str, idf: Dict[str, float], 
-                       expanded: List[str], must_inc: List[str], forbid: List[str], anchors: List[str]) -> float:
+                       expanded: List[str], must_inc: List[str], forbid: List[str]) -> float:
     """재랭크 점수식 구현 (중복 토큰 주입 금지) [semantic-rerank]"""
     s = 0.0
     for t in expanded:
@@ -255,10 +255,6 @@ def soft_semantic_score(doc_tokens: Set[str], doc_text: str, idf: Dict[str, floa
     for t in forbid:
         if t in doc_tokens: 
             s -= GAMMA * idf.get(t, 0.0)
-    if anchors:
-        for ph in anchors:
-            if ph and ph.lower() in doc_text.lower():
-                s += DELTA
     return s
 
 
@@ -335,8 +331,6 @@ def score_group_bm25_rerank(query: str,
         expanded = filter_semantic_terms(exp.get("keywords", []), df_dict, N, idf, False)
         must_inc = filter_semantic_terms(exp.get("must_include", []), df_dict, N, idf, True)
         forbidden = normalize_terms(exp.get("forbidden_terms", []))
-        anchors = normalize_terms(exp.get("anchors", []))
-
         # 확장된 쿼리 생성 (중복 제거)
         q_tokens_expanded = list(set(q_tokens + must_inc + expanded))
         if q_tokens_expanded:
@@ -347,15 +341,6 @@ def score_group_bm25_rerank(query: str,
         if must_inc:
             must_scores = bm25.get_scores(must_inc)
             base_scores = [s + MUST_WEIGHT * ms for s, ms in zip(base_scores, must_scores)]
-
-        # anchors 사전 보너스(소프트) → 후보 선정 이전
-        if anchors:
-            low_anchors = [a for a in anchors if a]
-            if low_anchors:
-                for i, (_, doc_text) in doc_index.items():
-                    lt = doc_text.lower()
-                    if any(a in lt for a in low_anchors):
-                        base_scores[i] += DELTA_PRE
     
     # TOP_R 후보 추출 (semantic 여부에 따라 다름)
     top_r = TOP_R_SEM if semantic else TOP_R_PURE
@@ -370,7 +355,7 @@ def score_group_bm25_rerank(query: str,
     
     # 2차: semantic=True이고 샘플링에 걸린 쿼리만 재랭크 적용
     if semantic and sem_data:
-        # 위에서 계산한 expanded/must_inc/forbidden/anchors를 재사용
+        # 위에서 계산한 expanded/must_inc/forbidden를 재사용
         # (없다면 안전하게 다시 계산)
         try:
             expanded
@@ -379,17 +364,15 @@ def score_group_bm25_rerank(query: str,
             expanded = filter_semantic_terms(exp.get("keywords", []), df_dict, N, idf, False)
             must_inc = filter_semantic_terms(exp.get("must_include", []), df_dict, N, idf, True)
             forbidden = normalize_terms(exp.get("forbidden_terms", []))
-            anchors = normalize_terms(exp.get("anchors", []))
         
         debug_info["filtered_terms"] = {
             "expanded": expanded,
             "must_include": must_inc,
-            "forbidden": forbidden,
-            "anchors": anchors
+            "forbidden": forbidden
         }
         
         # DF/IDF 필터로 적용할 게 없으면 스킵
-        if not expanded and not must_inc and not anchors and not forbidden:
+        if not expanded and not must_inc and not forbidden:
             debug_info["skipped_by_dfidf"] = True
         else:
             debug_info["semantic_applied"] = True
@@ -397,7 +380,7 @@ def score_group_bm25_rerank(query: str,
             reranked_candidates = []
             for doc_id in top_candidates:
                 doc_tokens, doc_text = doc_index[doc_id]
-                semantic_bonus = soft_semantic_score(doc_tokens, doc_text, idf, expanded, must_inc, forbidden, anchors)
+                semantic_bonus = soft_semantic_score(doc_tokens, doc_text, idf, expanded, must_inc, forbidden)
                 final_score = base_scores[doc_id] + semantic_bonus
                 reranked_candidates.append((doc_id, final_score))
             
@@ -565,7 +548,7 @@ def run_benchmark(semantic: bool,
                                     "keywords": row.get("expanded_keywords", []),
                                     "must_include": row.get("must_include", []),
                                     "forbidden_terms": row.get("forbidden_terms", []),
-                                    "anchors": row.get("anchors", []),
+
                                 }
                             }
             except Exception:
@@ -626,7 +609,7 @@ def run_benchmark(semantic: bool,
                 "expanded_keywords": filtered.get("expanded", []),
                 "must_include": filtered.get("must_include", []),
                 "forbidden_terms": filtered.get("forbidden", []),
-                "anchors": filtered.get("anchors", [])
+
             }
             with open(semantic_data_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(semantic_entry, ensure_ascii=False) + "\n")
@@ -687,14 +670,14 @@ def run_benchmark(semantic: bool,
             "ALPHA": ALPHA,
             "BETA": BETA,
             "GAMMA": GAMMA,
-            "DELTA": DELTA,
+
             "DF_THRESH": DF_THRESH,
             "IDF_MIN": IDF_MIN,
             "MAX_EXPANDED": MAX_EXPANDED,
             "MAX_MUST": MAX_MUST,
             "EXPANDED_WEIGHT": EXPANDED_WEIGHT,
             "MUST_WEIGHT": MUST_WEIGHT,
-            "DELTA_PRE": DELTA_PRE
+
         }
     }
     

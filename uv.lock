@@ -379,6 +379,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "rank-bm25" },
+    { name = "requests" },
 ]
 
 [package.metadata]
@@ -387,6 +388,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "rank-bm25" },
+    { name = "requests", specifier = ">=2.32.4" },
 ]
 
 [[package]]

@@ -2,6 +2,7 @@ from run_ms_marco import run_ms_marco
 from run_fiqa import run_fiqa
 from run_banking77 import run_banking77
 from run_stsb import run_stsb
+from run_clinc150 import run_clinc150
 
 def main():
     # # ms marco 실험 실행
@@ -14,7 +15,10 @@ def main():
     # run_banking77()
     
     # stsb 실험 실행
-    run_stsb()
+    # run_stsb()
+    
+    # clinc150 실험 실행
+    run_clinc150()
 
 if __name__ == "__main__":
     main()

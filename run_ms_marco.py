@@ -175,24 +175,49 @@ def build_semantic_data_ollama(query: str,
     }
     """
     prompt = f"""
-You are a data enrichment assistant. Given a user query, produce semantic_data JSON that helps BM25 retrieval.
-Only output valid JSON (no code fences), and keep lists concise but useful.
+You are a domain-adapted query expansion assistant for financial IR (BM25 + soft rerank).
+Return **ONLY** a single valid JSON object (no code fences, no prose).
 
-Example format:
+## Objective
+Maximize **recall** for BM25 by proposing broad yet relevant expansions.
+`expanded.keywords` is the most important field: it MUST contain multiple useful variants.
+
+## Output schema (strict)
 {{
-  "user_query": "Collect the latest U.S. Federal Reserve interest rate changes",
-  "intent_data": {{
-    "language": "en"
-  }},
+  "user_query": "<original query>",
+  "intent_data": {{"language": "en"}},
   "expanded": {{
-    "keywords": ["Federal Reserve interest rate changes", "US interest rate trends"],
-    "must_include": ["interest rate", "Federal Reserve"],
-    "forbidden_terms": ["cryptocurrency","Bitcoin"],
-
+    "keywords": ["<MUST be 4–8 distinct terms/phrases>"],
+    "must_include": ["<0–1 essential term>"],
+    "forbidden_terms": ["<0–1 off-domain term>"]
   }}
 }}
 
-Now produce semantic_data for this query:
+## Rules
+- `expanded.keywords`:
+  - Absolutely required: **4–8 items** (never fewer, never more).
+  - Each ≤ 4 words, short & meaningful.
+  - Prefer synonyms, financial domain variants, and broader category terms.
+  - Deduplicate, lowercase, no trivial forms (no just plural/singular).
+- `must_include`:
+  - At most 1 item, only if essential to preserve intent.
+- `forbidden_terms`:
+  - At most 1 item, only if clearly misleading/off-domain.
+- No other fields or commentary.
+- Always output valid JSON that matches the schema.
+
+## Good example
+{{
+  "user_query": "impact of us federal reserve interest rate hikes",
+  "intent_data": {{"language": "en"}},
+  "expanded": {{
+    "keywords": ["federal reserve rate hikes", "us interest rate changes", "monetary policy tightening", "fed funds rate increases", "us central bank policy", "interest rate announcements"],
+    "must_include": [],
+    "forbidden_terms": []
+  }}
+}}
+
+Now produce the JSON for this query:
 "{query}"
 """.strip()
 

@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-run_banking77.py
-- 실행만 하면 mteb/banking77 (실패 시 banking77)으로 3단계 실험을 순차 수행:
+run_stsb.py
+- 실행만 하면 sentence-transformers/stsb로 3단계 실험을 순차 수행:
   1) SBERT + Cosine (Baseline)
   2) SBERT + Cosine + Anchors (앵커는 Ollama gemma3 호출로 자동 생성)
   3) (2)의 Top-M을 CrossEncoder로 재정렬
@@ -41,7 +41,7 @@ ANCHOR_MODE = "weighted"             # 'weighted' 또는 'max'
 ALPHA = 0.7                          # weighted에서 원쿼리 비중
 
 # CrossEncoder 재정렬
-CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CROSS_ENCODER_MODEL = "cross-encoder/stsb-roberta-base"  # STS-B 전용 모델
 CE_MAX_LEN = 384
 TOP_M = 100                          # CE로 재정렬할 상위 후보 수 (정확도/지연 균형) (200→100으로 축소)
 
@@ -59,12 +59,12 @@ NEGATIVE_SAMPLES = 99  # 각 쿼리당 음성 샘플 수 (정답 1개 + 음성 9
 K_LIST = [10, 100]
 
 # 실험 제한 (빠른 테스트용)
-MAX_QUERIES = 100  # 최대 10개 쿼리만 실험
+MAX_QUERIES = 100  # 최대 100개 쿼리만 실험
 
 # 기타
 SEED = 42
-OUT_DIR = "results/similarity/banking77"
-CACHE_DIR = ".cache/similarity/banking77"      # Ollama 응답 캐시 디렉토리
+OUT_DIR = "results/similarity/stsb"
+CACHE_DIR = ".cache/similarity"      # Ollama 응답 캐시 디렉토리
 SHOW_PROGRESS = False                # SBERT encode progress bar
 
 # =========================
@@ -83,7 +83,7 @@ def ce_score_pairs_cached(ce, q_idx: int, q_text: str, doc_indices: List[int], c
             need_pairs.append([q_text, corpus_texts[d]])
             need_ids.append(d)
     if need_pairs:
-        preds = ce.predict(need_pairs)
+        preds = ce.predict(need_pairs)  # batch는 CE 내부 기본값 사용
         for d, s in zip(need_ids, preds):
             ce_cache[(q_idx, d)] = float(s)
     return np.array([ce_cache[(q_idx, d)] for d in doc_indices], dtype=np.float32)
@@ -91,28 +91,42 @@ def ce_score_pairs_cached(ce, q_idx: int, q_text: str, doc_indices: List[int], c
 def calibrate_ce_threshold(ce: CrossEncoder, query_texts: List[str], corpus_texts: List[str],
                            sample_pairs: int = 400, base_thr: float = 0.5) -> Tuple[float, dict]:
     """
-    랜덤 음성 쌍 점수 분포로 CE 임계값 보수적 보정.
-    권장: p95 이상으로 설정하여 Drop Precision 확보.
+    음성 위주 임의 쌍으로 CE 점수 분포를 샘플링 → 보수적 임계값 산출.
+    이상치 제거로 더 안정적인 p95 추정.
     """
     rng = np.random.default_rng(SEED)
-    pairs = []
-    n = min(len(query_texts), sample_pairs)
-    for _ in range(n):
-        q_idx = int(rng.integers(0, len(query_texts)))
-        d_idx = int(rng.integers(0, len(corpus_texts)))
-        # 같은 문장일 확률 희박하지만 안전 처리
-        if d_idx == q_idx:
-            d_idx = (d_idx + 1) % len(corpus_texts)
-        pairs.append([query_texts[q_idx], corpus_texts[d_idx]])
+    n_q = min(len(query_texts), sample_pairs // 2)
+    q_indices = rng.choice(len(query_texts), size=n_q, replace=False)
+    pairs, meta = [], {}
+
+    for q_idx in q_indices:
+        # q_idx와 다른 문서에서 음성 1개 샘플
+        doc_idx = int(rng.integers(0, len(corpus_texts)-1))
+        if doc_idx == q_idx:
+            doc_idx = (doc_idx + 1) % len(corpus_texts)
+        pairs.append([query_texts[q_idx], corpus_texts[doc_idx]])
 
     if not pairs:
         return base_thr, {"used_base": True}
 
-    scores = np.array(ce.predict(pairs), dtype=np.float32)
-    p95 = float(np.percentile(scores, 95))
-    thr = max(base_thr, p95)
-    meta = {"mean": float(scores.mean()), "std": float(scores.std()), "p95": p95, "base_thr": base_thr, "final_thr": thr, "n_pairs": len(scores)}
-    print(f"[CE-Calib] p95={p95:.3f} -> CE thr={thr:.3f}")
+    scores = ce.predict(pairs)
+    scores = np.array(scores, dtype=np.float32)
+    
+    # 이상치 제거: 상위 극단치(>0.9) 제외하여 더 안정적인 분포 추정
+    scores_filtered = scores[scores <= 0.9]
+    if len(scores_filtered) < len(scores) * 0.8:  # 너무 많이 제거되면 원본 사용
+        scores_filtered = scores
+    
+    mean, std = float(scores_filtered.mean()), float(scores_filtered.std())
+    p95 = float(np.percentile(scores_filtered, 95))
+    thr = max(base_thr, p95)  # 보수적 상향
+
+    meta = {
+        "mean": mean, "std": std, "p95": p95, "base_thr": base_thr, "final_thr": thr, 
+        "n_pairs": int(len(scores)), "n_filtered": int(len(scores_filtered)),
+        "outliers_removed": int(len(scores) - len(scores_filtered))
+    }
+    print(f"[CE-Calib] mean={mean:.3f}, std={std:.3f}, p95={p95:.3f} -> CE thr={thr:.3f} (outliers_removed={meta['outliers_removed']})")
     return thr, meta
 
 def set_seed(seed: int = 42):
@@ -148,13 +162,13 @@ def ndcg_at_k(order, relevant, k):
     idcg = sum(1.0 / np.log2(i + 1) for i in range(1, ideal + 1))
     return (dcg / idcg) if idcg > 0 else 0.0
 
-def pick_better_by_ndcg(order_a, order_b, relevant, k_focus=10):
-    a = ndcg_at_k(order_a, relevant, k_focus)
-    b = ndcg_at_k(order_b, relevant, k_focus)
+def pick_better_by_ndcg(order_a, order_b, gains_dict, k_focus=10):
+    a = ndcg_at_k_graded(order_a, gains_dict, k_focus)
+    b = ndcg_at_k_graded(order_b, gains_dict, k_focus)
     return (order_a, a) if a >= b else (order_b, b)
 
 def is_confident(order_baseline, scores_this, order_this,
-                 K_overlap=20, overlap_thr=0.6, margin_thr=0.03):
+                 K_overlap=20, overlap_thr=0.4, margin_thr=0.03):  # STS-B에서는 overlap_thr를 낮춤
     top_b = set(order_baseline[:K_overlap])
     top_t = set(order_this[:K_overlap])
     overlap = len(top_b & top_t) / max(len(top_b), 1)
@@ -213,40 +227,46 @@ def save_cache(query: str, anchors: List[str]):
 # =========================
 # 데이터
 # =========================
-def load_banking77_dataset():
-    # mteb/banking77 우선, 실패 시 banking77 폴백
+def load_stsb_dataset():
+    # sentence-transformers/stsb 데이터셋을 올바른 검색 형태로 변환
     try:
-        ds_train = load_dataset("mteb/banking77", split="train")
-        ds_test  = load_dataset("mteb/banking77", split="test")
-    except Exception:
-        ds_train = load_dataset("banking77", split="train")
-        ds_test  = load_dataset("banking77", split="test")
+        ds = load_dataset("sentence-transformers/stsb", split="test")
+    except Exception as e:
+        print(f"Error loading STSB dataset: {e}")
+        raise
 
-    corpus_texts  = [ex["text"] for ex in ds_train]
-    corpus_labels = [int(ex["label"]) for ex in ds_train]
-    query_texts   = [ex["text"] for ex in ds_test]
-    query_labels  = [int(ex["label"]) for ex in ds_test]
-    return corpus_texts, corpus_labels, query_texts, query_labels
+    # test split 내부에서 쿼리=sentence1, 코퍼스=sentence2로 설정
+    query_texts = [ex["sentence1"] for ex in ds]
+    corpus_texts = [ex["sentence2"] for ex in ds]
+    scores = [float(ex["score"]) for ex in ds]  # 0~5 연속값
+    
+    print(f"[STSB] Loaded {len(corpus_texts)} documents, {len(query_texts)} queries")
+    print(f"[STSB] Score range: {min(scores):.1f}-{max(scores):.1f}")
+    
+    return corpus_texts, query_texts, scores
+
+def create_filtering_candidates(corpus_texts, query_idx, n_negative=99):
+    """필터링용 후보 풀 생성: 정답 1개 + 음성 n_negative개"""
+    n_total = len(corpus_texts)
+    
+    # 정답 문서 (query_idx번째)
+    positive_doc = query_idx
+    
+    # 음성 문서들 (정답 제외하고 랜덤 샘플링)
+    all_indices = list(range(n_total))
+    all_indices.remove(positive_doc)  # 정답 제거
+    negative_docs = np.random.choice(all_indices, size=min(n_negative, len(all_indices)), replace=False)
+    
+    # 후보 풀 구성: [정답, 음성들]
+    candidate_pool = [positive_doc] + negative_docs.tolist()
+    
+    return candidate_pool, positive_doc, negative_docs.tolist()
 
 def build_label_index(labels: List[int]) -> Dict[int, List[int]]:
     idx = defaultdict(list)
     for i, lab in enumerate(labels):
         idx[lab].append(i)
     return idx
-
-def create_filtering_candidates(corpus_texts, corpus_labels, label_idx, query_label, n_negative=99):
-    """정답 1개(같은 라벨) + 음성 n_negative개(다른 라벨)"""
-    rng = np.random.default_rng(SEED)
-
-    positives = label_idx[query_label]
-    positive_doc = int(rng.choice(positives))      # 정답 하나 샘플
-
-    negative_candidates = [i for i, lab in enumerate(corpus_labels) if lab != query_label]
-    n_available = min(n_negative, len(negative_candidates))
-    negative_docs = rng.choice(negative_candidates, size=n_available, replace=False)
-
-    candidate_pool = [positive_doc] + negative_docs.tolist()
-    return candidate_pool, positive_doc, negative_docs.tolist()
 
 # =========================
 # Ollama Anchors
@@ -316,31 +336,6 @@ def rank_biencoder(q_emb: np.ndarray, doc_embs: np.ndarray) -> List[int]:
     sims = doc_embs @ q_emb
     return np.argsort(sims)[::-1].tolist()
 
-def rank_with_anchors(
-    q_emb: np.ndarray,
-    anchor_embs: Optional[np.ndarray],
-    doc_embs: np.ndarray,
-) -> List[int]:
-    """
-    base = cos(q,d)
-    anchors = max_a cos(a,d)
-    weighted: ALPHA*base + (1-ALPHA)*anchors
-    max: max(base, anchors)
-    """
-    base = doc_embs @ q_emb
-    if anchor_embs is None or len(anchor_embs) == 0:
-        scores = base
-    else:
-        max_anchor = None
-        for a in anchor_embs:
-            s = doc_embs @ a
-            max_anchor = s if max_anchor is None else np.maximum(max_anchor, s)
-        if ANCHOR_MODE == "max":
-            scores = np.maximum(base, max_anchor)
-        else:
-            scores = ALPHA * base + (1.0 - ALPHA) * max_anchor
-    return np.argsort(scores)[::-1].tolist()
-
 def rerank_crossencoder(
     ce: CrossEncoder,
     q_idx: int,
@@ -351,6 +346,7 @@ def rerank_crossencoder(
     if TOP_M <= 0:
         return base_order
     head = base_order[:min(TOP_M, len(base_order))]
+    # 캐시 사용
     head_scores = ce_score_pairs_cached(ce, q_idx, q, head, corpus_texts)
     head_reranked = [head[i] for i in np.argsort(head_scores)[::-1]]
     return head_reranked + list(base_order[len(head):])
@@ -358,39 +354,47 @@ def rerank_crossencoder(
 # =========================
 # 지표
 # =========================
-def ndcg_at_k_binary(ranked: List[int], relevant: set, k: int) -> float:
+def ndcg_at_k_graded(order: List[int], gains_dict: Dict[int, float], k: int, use_exp_gain: bool = False) -> float:
+    """Graded NDCG 계산 - gains_dict: {doc_id: gain_float}"""
     dcg = 0.0
-    for i, d in enumerate(ranked[:k], start=1):
-        if d in relevant:
-            dcg += 1.0 / np.log2(i + 1)
-    ideal = min(len(relevant), k)
-    idcg = sum(1.0 / np.log2(i + 1) for i in range(1, ideal + 1))
+    for i, d in enumerate(order[:k], start=1):
+        gain = gains_dict.get(d, 0.0)
+        if gain > 0:
+            if use_exp_gain:
+                gain = 2**gain - 1  # (2^score - 1) 형태의 gain
+            dcg += gain / np.log2(i + 1)
+    ideal_gains = sorted(gains_dict.values(), reverse=True)[:k]
+    idcg = sum((2**g - 1 if use_exp_gain else g) / np.log2(i + 1) for i, g in enumerate(ideal_gains, start=1))
     return (dcg / idcg) if idcg > 0 else 0.0
 
-def compute_metrics(ranked: List[int], relevant: set) -> Dict[str, float]:
+def compute_metrics(order: List[int], gold_doc_id: int, k_list: List[int]) -> tuple[Dict[str, float], int]:
+    """STS-B용 지표 계산 - 정답 문서가 1개인 경우"""
     out = {}
-    for k in K_LIST:
-        topk = ranked[:k]
-        hit = sum(1 for d in topk if d in relevant)
-        denom_rel = max(len(relevant), 1)
-        out[f"R@{k}"] = hit / denom_rel
-        out[f"P@{k}"] = hit / max(k, 1)
-        out[f"NDCG@{k}"] = ndcg_at_k_binary(ranked, relevant, k)
-    # MRR
-    rr = 0.0
-    for rank, d in enumerate(ranked, start=1):
-        if d in relevant:
-            rr = 1.0 / rank
+    
+    # 정답 문서의 순위 찾기
+    gold_rank = 0
+    for rank, doc_id in enumerate(order, start=1):
+        if doc_id == gold_doc_id:
+            gold_rank = rank
             break
-    out["MRR"] = rr
-    return out
-
-def aggregate_metrics(all_metrics: Dict[str, List[float]]) -> Dict[str, float]:
-    return {k: float(np.mean(v)) for k, v in all_metrics.items()}
+    
+    # 각 k에 대해 지표 계산
+    for k in k_list:
+        topk = order[:k]
+        # Recall@k: 정답이 top-k 안에 있으면 1.0, 아니면 0.0
+        recall = 1.0 if gold_doc_id in topk else 0.0
+        out[f"R@{k}"] = recall
+        # Precision@k: Recall@k / k
+        out[f"P@{k}"] = recall / k
+    
+    # MRR: 1/rank (정답의 순위), 없으면 0
+    out["MRR"] = 1.0 / gold_rank if gold_rank > 0 else 0.0
+    
+    return out, gold_rank
 
 def compute_filtering_metrics(sbert_scores, anchor_scores, ce_scores, 
                             candidate_pool, positive_doc, negative_docs,
-                            thresholds=None, on_intent_ids=None):
+                            thresholds=None):
     """필터링 성능 지표 계산"""
     if thresholds is None:
         thresholds = DROP_THRESHOLDS
@@ -429,10 +433,6 @@ def compute_filtering_metrics(sbert_scores, anchor_scores, ce_scores,
     positive_kept = positive_doc in keep_decisions
     keep_recall = 1.0 if positive_kept else 0.0
     
-    # Keep Recall Any = 같은 라벨 문서 중 하나라도 keep이면 1
-    kept_set = set(keep_decisions)
-    keep_any = 1.0 if (on_intent_ids is not None and len(kept_set & set(on_intent_ids)) > 0) else 0.0
-    
     # Coverage = drop/keep으로 판정된 비율 (보류 제외)
     coverage = (len(drop_decisions) + len(keep_decisions)) / total_candidates
     
@@ -440,24 +440,25 @@ def compute_filtering_metrics(sbert_scores, anchor_scores, ce_scores,
         "Drop_Precision": drop_precision,
         "Drop_Recall": drop_recall,
         "Keep_Recall": keep_recall,
-        "Keep_Recall_Any": keep_any,
         "Coverage": coverage,
         "Dropped_Count": len(drop_decisions),
         "Kept_Count": len(keep_decisions)
     }
 
+def aggregate_metrics(all_metrics: Dict[str, List[float]]) -> Dict[str, float]:
+    return {k: float(np.mean(v)) for k, v in all_metrics.items()}
+
 # =========================
 # 메인 루틴
 # =========================
-def run_banking77():
+def run_stsb():
     set_seed(SEED)
     ensure_dir(OUT_DIR)
     ensure_dir(CACHE_DIR)  # 캐시 디렉토리 생성
     t_all = timer_ms()
 
     # 1) 데이터
-    corpus_texts, corpus_labels, query_texts, query_labels = load_banking77_dataset()
-    label_idx = build_label_index(corpus_labels)
+    corpus_texts, query_texts, scores = load_stsb_dataset()
 
     # 2) SBERT 준비 및 코퍼스 임베딩
     print(f"[SBERT] {SBERT_MODEL} (max_len={SBERT_MAX_SEQ_LEN})")
@@ -483,27 +484,23 @@ def run_banking77():
 
     results_paths = {}
 
-    # ---- 후보 풀 캐시 (동일 쿼리에서 후보 풀 재사용) ----
-    candidate_cache = {}
-
     # ---------------- 1) Baseline ----------------
     print("\n[Run] 1) SBERT + Cosine (Baseline)")
     agg = defaultdict(list)
     filter_agg = defaultdict(list)
     t1 = timer_ms()
-    for i, (q, lab) in enumerate(zip(query_texts, query_labels)):
+    for i, q in enumerate(query_texts):
         if i >= MAX_QUERIES:
             break
         print(f"[Baseline] Processing query {i+1}/{min(MAX_QUERIES, len(query_texts))}")
-        relevant = set(label_idx[lab])
         
-        # 필터링용 후보 풀 생성 (캐시 재사용)
-        key = i  # 쿼리 인덱스
-        if key not in candidate_cache:
-            candidate_cache[key] = create_filtering_candidates(
-                corpus_texts, corpus_labels, label_idx, lab, NEGATIVE_SAMPLES
-            )
-        candidate_pool, positive_doc, negative_docs = candidate_cache[key]
+        # i번째 쿼리의 정답 문서 ID
+        gold_doc_id = i
+        
+        # 필터링용 후보 풀 생성
+        candidate_pool, positive_doc, negative_docs = create_filtering_candidates(
+            corpus_texts, i, NEGATIVE_SAMPLES
+        )
         
         # SBERT 임베딩 및 점수 계산
         q_emb = embed_texts(sbert, [q], 1)[0]
@@ -515,8 +512,12 @@ def run_banking77():
         candidate_embs = doc_embs[candidate_pool]
         sbert_scores = candidate_embs @ q_emb
         
-        # 기존 랭킹 지표 계산
-        m = compute_metrics(order, relevant)
+        # Binary 지표 계산 (기존 랭킹 평가)
+        m_bin, gold_rank = compute_metrics(order, gold_doc_id, K_LIST)
+        # Graded NDCG 계산
+        m_ndcg = {f"NDCG@{k}": ndcg_at_k_graded(order, {i: scores[i]}, k) for k in K_LIST}
+        # 결과 병합
+        m = {**m_bin, **m_ndcg}
         
         # 필터링 지표 계산
         # Baseline에서는 앵커와 CE 점수를 미사용으로 설정 (절대 드롭에 기여하지 않음)
@@ -525,11 +526,10 @@ def run_banking77():
         
         filter_metrics = compute_filtering_metrics(
             sbert_scores, anchor_scores, ce_scores,
-            candidate_pool, positive_doc, negative_docs,
-            on_intent_ids=label_idx[lab]
+            candidate_pool, positive_doc, negative_docs
         )
         
-        print(f"[Baseline] Dropped: {filter_metrics['Dropped_Count']}")
+        print(f"[Baseline] Gold rank: {gold_rank}, Dropped: {filter_metrics['Dropped_Count']}")
         
         # 결과 저장
         for k, v in m.items():
@@ -539,17 +539,18 @@ def run_banking77():
     res = {
         "meta": {
             "variant": "sbert_cosine",
-            "dataset": "banking77",
+            "dataset": "stsb",
             "sbert": SBERT_MODEL,
             "k_list": K_LIST,
             "seed": SEED,
             "drop_thresholds": DROP_THRESHOLDS,
+            "ce_calibration": ce_calib_meta,
         },
         "metrics": aggregate_metrics(agg),
         "filter_metrics": aggregate_metrics(filter_agg),
         "elapsed_ms": t1()
     }
-    p1 = os.path.join(OUT_DIR, "banking77_sbert_cosine.json")
+    p1 = os.path.join(OUT_DIR, "stsb_sbert_cosine.json")
     save_json(res, p1)
     print(f"[Saved] {p1}")
     results_paths["baseline"] = p1
@@ -560,19 +561,18 @@ def run_banking77():
     agg = defaultdict(list)
     filter_agg = defaultdict(list)
     t2 = timer_ms()
-    for i, (q, lab) in enumerate(zip(query_texts, query_labels)):
+    for i, q in enumerate(query_texts):
         if i >= MAX_QUERIES:
             break
         print(f"[Anchors] Processing query {i+1}/{min(MAX_QUERIES, len(query_texts))}")
-        relevant = set(label_idx[lab])
         
-        # 필터링용 후보 풀 생성 (캐시 재사용)
-        key = i  # 쿼리 인덱스
-        if key not in candidate_cache:
-            candidate_cache[key] = create_filtering_candidates(
-                corpus_texts, corpus_labels, label_idx, lab, NEGATIVE_SAMPLES
-            )
-        candidate_pool, positive_doc, negative_docs = candidate_cache[key]
+        # i번째 쿼리의 정답 문서 ID
+        gold_doc_id = i
+        
+        # 필터링용 후보 풀 생성
+        candidate_pool, positive_doc, negative_docs = create_filtering_candidates(
+            corpus_texts, i, NEGATIVE_SAMPLES
+        )
         
         # Baseline 점수/순위 (이미 계산되어 있으면 재사용)
         q_emb = embed_texts(sbert, [q], 1)[0]
@@ -590,25 +590,34 @@ def run_banking77():
             if is_confident(order_base, sims_a, order_a):
                 accepted_scores.append(sims_a)
         
-        # 확실 앵커가 있으면 per-doc max 결합
+        # 확실 앵커가 있으면 결합 (ANCHOR_MODE에 따라)
         if len(accepted_scores) > 1:
-            S = np.stack(accepted_scores, axis=1)   # (N, n_versions)
-            sims_merged = S.max(axis=1)             # (N,)
+            S = np.stack(accepted_scores, axis=1)   # (N, n_versions) [base, a1, a2, ...]
+            base = S[:, 0]
+            anchors_max = S[:, 1:].max(axis=1) if S.shape[1] > 1 else base
+            if ANCHOR_MODE == "max":
+                sims_merged = np.maximum(base, anchors_max)
+            else:  # 'weighted'
+                sims_merged = ALPHA * base + (1.0 - ALPHA) * anchors_max
             order_merged = np.argsort(sims_merged)[::-1]
             # 안전-가드: Baseline vs Merged 중 더 좋은 쪽만 선택 (NDCG@10)
-            order_pick, _ = pick_better_by_ndcg(order_base, order_merged, relevant, k_focus=10)
+            order_pick, _ = pick_better_by_ndcg(order_base, order_merged, {i: scores[i]}, k_focus=10)
         else:
             order_pick = order_base
         
         # 로그 출력
-        print(f"[Anchors] accepted_rate={ (len(accepted_scores)-1) / max(len(anchors),1):.2f}")
         print(f"[Anchors] accepted={len(accepted_scores)-1} (of {len(anchors)})")
-        before = ndcg_at_k(order_base, relevant, 10)
-        afterA = ndcg_at_k(order_pick, relevant, 10)
+        print(f"[Anchors] accepted_rate={ (len(accepted_scores)-1) / max(len(anchors),1):.2f}")
+        before = ndcg_at_k_graded(order_base, {i: scores[i]}, 10)
+        afterA = ndcg_at_k_graded(order_pick, {i: scores[i]}, 10)
         print(f"[Guard] Base→Anchors NDCG@10: {before:.3f} → {afterA:.3f}")
         
-        # 기존 랭킹 지표 계산
-        m = compute_metrics(order_pick, relevant)
+        # Binary 지표 계산 (기존 랭킹 평가)
+        m_bin, gold_rank = compute_metrics(order_pick, gold_doc_id, K_LIST)
+        # Graded NDCG 계산
+        m_ndcg = {f"NDCG@{k}": ndcg_at_k_graded(order_pick, {i: scores[i]}, k) for k in K_LIST}
+        # 결과 병합
+        m = {**m_bin, **m_ndcg}
         
         # 필터링 지표 계산
         # 후보 풀에 대한 점수 계산
@@ -630,11 +639,10 @@ def run_banking77():
         
         filter_metrics = compute_filtering_metrics(
             sbert_scores, anchor_scores, ce_scores,
-            candidate_pool, positive_doc, negative_docs,
-            on_intent_ids=label_idx[lab]
+            candidate_pool, positive_doc, negative_docs
         )
         
-        print(f"[Anchors] Dropped: {filter_metrics['Dropped_Count']}")
+        print(f"[Anchors] Gold rank: {gold_rank}, Dropped: {filter_metrics['Dropped_Count']}")
         
         # 결과 저장
         for k, v in m.items():
@@ -644,7 +652,7 @@ def run_banking77():
     res = {
         "meta": {
             "variant": "sbert_anchors",
-            "dataset": "banking77",
+            "dataset": "stsb",
             "sbert": SBERT_MODEL,
             "anchor_count": ANCHOR_COUNT,
             "anchor_mode": ANCHOR_MODE,
@@ -655,12 +663,13 @@ def run_banking77():
             "k_list": K_LIST,
             "seed": SEED,
             "drop_thresholds": DROP_THRESHOLDS,
+            "ce_calibration": ce_calib_meta,
         },
-    "metrics": aggregate_metrics(agg),
-    "filter_metrics": aggregate_metrics(filter_agg),
-    "elapsed_ms": t2()
+        "metrics": aggregate_metrics(agg),
+        "filter_metrics": aggregate_metrics(filter_agg),
+        "elapsed_ms": t2()
     }
-    p2 = os.path.join(OUT_DIR, "banking77_sbert_anchors.json")
+    p2 = os.path.join(OUT_DIR, "stsb_sbert_anchors.json")
     save_json(res, p2)
     print(f"[Saved] {p2}")
     results_paths["anchors"] = p2
@@ -671,19 +680,18 @@ def run_banking77():
     agg = defaultdict(list)
     filter_agg = defaultdict(list)
     t3 = timer_ms()
-    for i, (q, lab) in enumerate(zip(query_texts, query_labels)):
+    for i, q in enumerate(query_texts):
         if i >= MAX_QUERIES:
             break
         print(f"[Re-rank] Processing query {i+1}/{min(MAX_QUERIES, len(query_texts))}")
-        relevant = set(label_idx[lab])
         
-        # 필터링용 후보 풀 생성 (캐시 재사용)
-        key = i  # 쿼리 인덱스
-        if key not in candidate_cache:
-            candidate_cache[key] = create_filtering_candidates(
-                corpus_texts, corpus_labels, label_idx, lab, NEGATIVE_SAMPLES
-            )
-        candidate_pool, positive_doc, negative_docs = candidate_cache[key]
+        # i번째 쿼리의 정답 문서 ID
+        gold_doc_id = i
+        
+        # 필터링용 후보 풀 생성
+        candidate_pool, positive_doc, negative_docs = create_filtering_candidates(
+            corpus_texts, i, NEGATIVE_SAMPLES
+        )
         
         # Baseline 점수/순위 (이미 계산되어 있으면 재사용)
         q_emb = embed_texts(sbert, [q], 1)[0]
@@ -701,32 +709,41 @@ def run_banking77():
             if is_confident(order_base, sims_a, order_a):
                 accepted_scores.append(sims_a)
         
-        # 확실 앵커가 있으면 per-doc max 결합
+        # 확실 앵커가 있으면 결합 (ANCHOR_MODE에 따라)
         if len(accepted_scores) > 1:
-            S = np.stack(accepted_scores, axis=1)   # (N, n_versions)
-            sims_merged = S.max(axis=1)             # (N,)
+            S = np.stack(accepted_scores, axis=1)   # (N, n_versions) [base, a1, a2, ...]
+            base = S[:, 0]
+            anchors_max = S[:, 1:].max(axis=1) if S.shape[1] > 1 else base
+            if ANCHOR_MODE == "max":
+                sims_merged = np.maximum(base, anchors_max)
+            else:  # 'weighted'
+                sims_merged = ALPHA * base + (1.0 - ALPHA) * anchors_max
             order_merged = np.argsort(sims_merged)[::-1]
             # 안전-가드: Baseline vs Merged 중 더 좋은 쪽만 선택 (NDCG@10)
-            order_pick, _ = pick_better_by_ndcg(order_base, order_merged, relevant, k_focus=10)
+            order_pick, _ = pick_better_by_ndcg(order_base, order_merged, {i: scores[i]}, k_focus=10)
         else:
             order_pick = order_base
         
         # CrossEncoder 재정렬에 안전-가드 추가
         order_ce = rerank_crossencoder(ce, i, q, corpus_texts, order_pick)
-        order_final, _ = pick_better_by_ndcg(order_pick, order_ce, relevant, k_focus=10)
+        order_final, _ = pick_better_by_ndcg(order_pick, order_ce, {i: scores[i]}, k_focus=10)
         
         # 로그 출력
-        print(f"[Anchors] accepted_rate={ (len(accepted_scores)-1) / max(len(anchors),1):.2f}")
         print(f"[Anchors] accepted={len(accepted_scores)-1} (of {len(anchors)})")
+        print(f"[Anchors] accepted_rate={ (len(accepted_scores)-1) / max(len(anchors),1):.2f}")
         print(f"[CE] thr={DROP_THRESHOLDS['ce']:.3f}, cached_pairs={len(ce_cache)}")
-        before = ndcg_at_k(order_base, relevant, 10)
-        afterA = ndcg_at_k(order_pick, relevant, 10)
-        afterCE = ndcg_at_k(order_final, relevant, 10)
+        before = ndcg_at_k_graded(order_base, {i: scores[i]}, 10)
+        afterA = ndcg_at_k_graded(order_pick, {i: scores[i]}, 10)
+        afterCE = ndcg_at_k_graded(order_final, {i: scores[i]}, 10)
         print(f"[Guard] Base→Anchors NDCG@10: {before:.3f} → {afterA:.3f}")
         print(f"[Guard] Anchors→CE NDCG@10: {afterA:.3f} → {afterCE:.3f}")
         
-        # 기존 랭킹 지표 계산
-        m = compute_metrics(order_final, relevant)
+        # Binary 지표 계산 (기존 랭킹 평가)
+        m_bin, gold_rank = compute_metrics(order_final, gold_doc_id, K_LIST)
+        # Graded NDCG 계산
+        m_ndcg = {f"NDCG@{k}": ndcg_at_k_graded(order_final, {i: scores[i]}, k) for k in K_LIST}
+        # 결과 병합
+        m = {**m_bin, **m_ndcg}
         
         # 필터링 지표 계산
         # 후보 풀에 대한 점수 계산
@@ -759,11 +776,10 @@ def run_banking77():
         
         filter_metrics = compute_filtering_metrics(
             sbert_scores, anchor_scores, ce_scores,
-            candidate_pool, positive_doc, negative_docs,
-            on_intent_ids=label_idx[lab]
+            candidate_pool, positive_doc, negative_docs
         )
         
-        print(f"[Re-rank] Dropped: {filter_metrics['Dropped_Count']}")
+        print(f"[Re-rank] Gold rank: {gold_rank}, Dropped: {filter_metrics['Dropped_Count']}")
         
         # 결과 저장
         for k, v in m.items():
@@ -773,7 +789,7 @@ def run_banking77():
     res = {
         "meta": {
             "variant": "sbert_anchors_ce",
-            "dataset": "banking77",
+            "dataset": "stsb",
             "sbert": SBERT_MODEL,
             "anchor_count": ANCHOR_COUNT,
             "anchor_mode": ANCHOR_MODE,
@@ -788,11 +804,11 @@ def run_banking77():
             "drop_thresholds": DROP_THRESHOLDS,
             "ce_calibration": ce_calib_meta,
         },
-    "metrics": aggregate_metrics(agg),
-    "filter_metrics": aggregate_metrics(filter_agg),
-    "elapsed_ms": t3()
+        "metrics": aggregate_metrics(agg),
+        "filter_metrics": aggregate_metrics(filter_agg),
+        "elapsed_ms": t3()
     }
-    p3 = os.path.join(OUT_DIR, "banking77_sbert_anchors_ce.json")
+    p3 = os.path.join(OUT_DIR, "stsb_sbert_anchors_ce.json")
     save_json(res, p3)
     print(f"[Saved] {p3}")
     results_paths["anchors_ce"] = p3
@@ -804,13 +820,13 @@ def run_banking77():
         "max_queries": MAX_QUERIES,
         "total_queries": len(query_texts)
     }
-    p_sum = os.path.join(OUT_DIR, "banking77_summary.json")
+    p_sum = os.path.join(OUT_DIR, "stsb_summary.json")
     save_json(summary, p_sum)
     print(f"\n[Summary Saved] {p_sum}")
     
     # 핵심 결과 콘솔 출력
     print("\n" + "="*80)
-    print("🏆 BANKING77 벤치마크 결과 요약")
+    print("🏆 STSB 벤치마크 결과 요약")
     print("="*80)
     print(f"📊 실험 규모: {MAX_QUERIES}개 쿼리 (전체 {len(query_texts)}개 중)")
     print(f"⏱️  총 실행 시간: {t_all():.1f}ms ({t_all()/1000:.1f}초)")
@@ -957,4 +973,4 @@ def run_banking77():
     print("="*80)
 
 if __name__ == "__main__":
-    run_banking77()
+    run_stsb()

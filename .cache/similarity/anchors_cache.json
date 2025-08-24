@@ -1,0 +1,132 @@
+[
+  {
+    "query": "How do I locate my card?",
+    "expanded": {
+      "anchors": [
+        "Lost card recovery steps",
+        "Card tracking options",
+        "Reporting a lost or stolen card",
+        "Finding a misplaced debit or credit card",
+        "Checking account card locator tools",
+        "Card replacement procedures"
+      ]
+    }
+  },
+  {
+    "query": "I still have not received my new card, I ordered over a week ago.",
+    "expanded": {
+      "anchors": [
+        "Lost card replacement",
+        "Delayed card delivery",
+        "Order status inquiry",
+        "Recent card order issues",
+        "Tracking card shipment",
+        "Card not received after order"
+      ]
+    }
+  },
+  {
+    "query": "I ordered a card but it has not arrived. Help please!",
+    "expanded": {
+      "anchors": [
+        "Delivery issues",
+        "Lost mail",
+        "Delayed orders",
+        "Missing packages",
+        "Order tracking problems",
+        "Customer service inquiries"
+      ]
+    }
+  },
+  {
+    "query": "Is there a way to know when my card will arrive?",
+    "expanded": {
+      "anchors": [
+        "Tracking card shipments.",
+        "Delivery timelines for credit cards.",
+        "Checking card arrival dates.",
+        "Shipping status updates for cards.",
+        "Estimating card delivery times.",
+        "Card arrival notifications."
+      ]
+    }
+  },
+  {
+    "query": "My card has not arrived yet.",
+    "expanded": {
+      "anchors": [
+        "Lost credit card",
+        "Delayed shipment",
+        "Missing card delivery",
+        "Unreceived payment card",
+        "Card not yet delivered",
+        "Payment card arrival issues"
+      ]
+    }
+  },
+  {
+    "query": "When will I get my card?",
+    "expanded": {
+      "anchors": [
+        "Shipping timelines for new cards",
+        "Card delivery estimates",
+        "Tracking my card order",
+        "Card delivery status updates",
+        "Expected card arrival date",
+        "Card delivery FAQs"
+      ]
+    }
+  },
+  {
+    "query": "Do you know if there is a tracking number for the new card you sent me?",
+    "expanded": {
+      "anchors": [
+        "Shipping details",
+        "Order tracking",
+        "Delivery confirmation",
+        "Package status",
+        "Recent shipment",
+        "Card delivery"
+      ]
+    }
+  },
+  {
+    "query": "i have not received my card",
+    "expanded": {
+      "anchors": [
+        "Lost card replacement",
+        "Card delivery issues",
+        "Unreceived payment card",
+        "Card not arriving",
+        "Delayed card shipment",
+        "Problems with card receipt"
+      ]
+    }
+  },
+  {
+    "query": "still waiting on that card",
+    "expanded": {
+      "anchors": [
+        "Payment delays",
+        "Card issues",
+        "Order status",
+        "Shipping problems",
+        "Account inquiries",
+        "Transaction disputes"
+      ]
+    }
+  },
+  {
+    "query": "Is it normal to have to wait over a week for my new card?",
+    "expanded": {
+      "anchors": [
+        "Credit card delays can be frustrating.",
+        "Long card delivery times are a common issue.",
+        "Understanding credit card processing timelines is important.",
+        "What's considered a normal timeframe for a new card?",
+        "Delayed card arrival: causes and solutions.",
+        "Checking credit card delivery estimates."
+      ]
+    }
+  }
+]

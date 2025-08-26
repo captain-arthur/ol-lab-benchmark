@@ -1,7 +1,6 @@
 # run_fiqa.py
 import os
 import json
-import csv
 import re
 import math
 import time
@@ -19,7 +18,7 @@ import requests
 EXPERIMENT_CONFIG = {
     "max_queries": 20,           # 기본값: 20
     "split": "test",             # mteb/fiqa는 test 사용
-    "out_dir": "results/fiqa"
+    "out_dir": "results/keyword/fiqa"
 }
 
 # 환경변수 오버라이드
@@ -34,14 +33,12 @@ TOP_R_SEM = 1000                # semantic BM25 상위 후보 수 (환경변수�
 ALPHA = 0.5                     # expanded_keywords soft boost
 BETA  = 1.2                     # must_include soft boost
 GAMMA = 1.8                     # forbidden_terms soft penalty (감점)
-EXPANDED_WEIGHT = 0.4           # 확장 쿼리 가중합 계수
+EXPANDED_WEIGHT = 0.4           # (현재 사용 안 함: 가산형 보너스만 적용)
 DF_THRESH = 0.80                # DF 필터 임계
 IDF_MIN = 0.1                   # IDF 필터 임계
 MAX_EXPANDED = 8
 MAX_MUST = 3
 SEMANTIC_SAMPLE_RATE = 1.0      # 의미확장 적용 비율
-MUST_WEIGHT = 0.2               # must_include 소프트 가중(후보 선정 이전) - 사용 안함(후보 재랭크 방식으로 대체)
-DELTA_PRE = 0.3                 # anchors 사전 보너스(후보 선정 이전) - 사용 안함(후보 재랭크에서 일괄 처리)
 
 try:
     TOP_R_SEM = int(os.getenv("OL_TOP_R_SEM", str(TOP_R_SEM)))
@@ -142,15 +139,15 @@ def build_semantic_data_ollama(query: str,
 You are a data enrichment assistant. Given a user query, produce semantic_data JSON that helps BM25 retrieval.
 Only output valid JSON (no code fences), and keep lists concise but useful.
 
-Example format:
+Required format:
 {{
-  "user_query": "What are the risks of investing in cryptocurrency?",
+  "user_query": "<original query>",
   "intent_data": {{"language": "en"}},
-      "expanded": {{
-      "keywords": ["cryptocurrency investment risks","digital currency volatility"],
-      "must_include": ["investment","risks"],
-      "forbidden_terms": ["gaming","entertainment"]
-    }}
+  "expanded": {{
+    "keywords": ["2-8 short phrases"],
+    "must_include": ["0-3 tokens or short phrases"],
+    "forbidden_terms": ["0-6 tokens or short phrases"]
+  }}
 }}
 
 Now produce semantic_data for this query:
@@ -222,6 +219,28 @@ def load_fiqa_data(split: str = "test") -> Tuple[List[str], List[Dict[str, Any]]
 
 
 # -----------------------------
+# Helpers for semantic terms (phrase → token)
+# -----------------------------
+def terms_to_tokens(terms: List[str]) -> List[str]:
+    """문구 리스트를 토큰 리스트로 평탄화 + dedup"""
+    toks: List[str] = []
+    for phrase in normalize_terms(terms or []):
+        toks.extend(tokenize_en(phrase))
+    return dedup(toks)
+
+def _filter_sem_tokens(tokens: List[str],
+                       df_dict: Dict[str, int],
+                       N: int,
+                       idf: Dict[str, float],
+                       limit: int) -> List[str]:
+    kept = []
+    for t in tokens:
+        if (df_dict.get(t, 0) / max(N, 1)) <= DF_THRESH and idf.get(t, 0.0) >= IDF_MIN:
+            kept.append(t)
+    return dedup(kept)[:limit]
+
+
+# -----------------------------
 # Core: per-query scoring & rerank (candidate-level)
 # -----------------------------
 def rerank_on_candidates(query_text: str,
@@ -232,7 +251,7 @@ def rerank_on_candidates(query_text: str,
                          sem_data: Optional[Dict[str, Any]]) -> Tuple[List[int], List[float], Dict[str, Any]]:
     """
     1) BM25로 전코퍼스 base_scores에서 상위 top_r 후보 인덱스 선택
-    2) semantic 데이터가 있으면 후보 텍스트만으로 DF/IDF, 토큰셋 구성 후 soft 보너스 적용
+    2) semantic 데이터가 있으면 후보 텍스트만으로 DF/IDF, 토큰셋 구성 후 soft 보너스/패널티 적용
     3) 후보 내에서만 재정렬 → 최종 순서/점수 반환
     """
     N = len(documents)
@@ -254,10 +273,15 @@ def rerank_on_candidates(query_text: str,
     idf = build_idf_dict_from_df(df_dict, len(cand_texts))
     doc_index = build_doc_token_index(cand_texts)
 
-    exp = sem_data.get("expanded", {})
-    expanded  = _filter_sem_terms(exp.get("keywords", []), df_dict, len(cand_texts), idf, is_must=False)
-    must_inc  = _filter_sem_terms(exp.get("must_include", []), df_dict, len(cand_texts), idf, is_must=True)
-    forbidden = normalize_terms(exp.get("forbidden_terms", []))
+    # --- 확장어/머스트/금지어: 문구 → 토큰화 후 필터 ---
+    exp = sem_data.get("expanded", {}) or {}
+    expanded_tokens_in = terms_to_tokens(exp.get("keywords", []))
+    must_tokens_in     = terms_to_tokens(exp.get("must_include", []))
+    forbidden_tokens   = terms_to_tokens(exp.get("forbidden_terms", []))
+
+    expanded  = _filter_sem_tokens(expanded_tokens_in, df_dict, len(cand_texts), idf, limit=MAX_EXPANDED)
+    must_inc  = _filter_sem_tokens(must_tokens_in,     df_dict, len(cand_texts), idf, limit=MAX_MUST)
+    forbidden = _filter_sem_tokens(forbidden_tokens,   df_dict, len(cand_texts), idf, limit=32)
 
     debug["filtered_terms"] = {"expanded": expanded, "must_include": must_inc, "forbidden": forbidden}
 
@@ -269,21 +293,10 @@ def rerank_on_candidates(query_text: str,
 
     debug["semantic_applied"] = True
 
-    # 확장 쿼리 가중합 (BM25 기준) - 후보 스코어에 가법
-    q_tokens = tokenize_en(query_text)
-    base_subset_scores = [float(base_scores[i]) for i in cand_idx]
-    if expanded or must_inc:
-        q_tokens_expanded = list(set(q_tokens + must_inc + expanded))
-        if q_tokens_expanded:
-            # 후보 텍스트만 토큰화해서 임시 BM25를 만들 수도 있지만,
-            # 이미 base_scores는 전코퍼스 기준이므로 여기서는 soft bonus만 추가
-            pass
-
-    # soft bonus 계산
+    # soft bonus / penalty 계산 (가산형, 비음수/음수)
     pairs = []
     for loc, (_tokset, passage) in doc_index.items():
-        global_i = cand_idx[loc]
-        s = base_subset_scores[loc]
+        s = float(base_scores[cand_idx[loc]])
 
         # expanded, must_include 보너스(IDF 가중)
         for t in expanded:
@@ -306,19 +319,6 @@ def rerank_on_candidates(query_text: str,
     final_global_order = [cand_idx[loc] for loc in final_local_order]
 
     return final_global_order, final_scores_local, debug
-
-
-def _filter_sem_terms(terms: List[str],
-                      df_dict: Dict[str, int],
-                      N: int,
-                      idf: Dict[str, float],
-                      is_must: bool = False) -> List[str]:
-    kept = []
-    for t in normalize_terms(terms or []):
-        if (df_dict.get(t, 0) / max(N, 1)) <= DF_THRESH and idf.get(t, 0.0) >= IDF_MIN:
-            kept.append(t)
-    limit = MAX_MUST if is_must else MAX_EXPANDED
-    return dedup(kept)[:limit]
 
 
 # -----------------------------
@@ -352,12 +352,11 @@ def run_benchmark(semantic: bool = False,
     save_dir = os.path.join(out_dir, mode)
     ensure_dir(save_dir)
 
-    rankings_path = os.path.join(save_dir, "rankings.csv")
     metrics_path  = os.path.join(save_dir, "metrics.json")
 
     if semantic:
         semantic_data_path = os.path.join(save_dir, "semantic_data.jsonl")
-        cache_dir = os.path.join(out_dir, ".cache")
+        cache_dir = ".cache/keyword/fiqa"
         ensure_dir(cache_dir)
         cache_path = os.path.join(cache_dir, "ollama_cache.json")
         if os.path.exists(cache_path):
@@ -385,7 +384,6 @@ def run_benchmark(semantic: bool = False,
                                         "keywords": row.get("expanded_keywords", []),
                                         "must_include": row.get("must_include", []),
                                         "forbidden_terms": row.get("forbidden_terms", []),
-
                                     }
                                 }
                         except Exception:
@@ -407,6 +405,8 @@ def run_benchmark(semantic: bool = False,
 
     np.random.seed(42)
     t0 = time.time()
+
+
 
     for qi, q in enumerate(queries, 1):
         qid, qtext = q["query_id"], q["query"]
@@ -432,31 +432,30 @@ def run_benchmark(semantic: bool = False,
             else:
                 misses += 1
                 sem_data = build_semantic_data_ollama(qtext)
-                skipped_by_dfidf += 1  # 생성 실패도 스킵으로 집계
+                if sem_data:  # 생성 성공 시 캐시에 보관
+                    cache[k] = sem_data
 
         # 후보 재랭크
         top_r = TOP_R_SEM if (semantic and sem_data) else TOP_R_PURE
         final_order, final_scores, debug = rerank_on_candidates(
             qtext, bm25, documents, base_scores, top_r, sem_data
         )
-        
-        # ↓ 여기 추가
-        if semantic and sem_data and debug.get("semantic_applied", False):
-            sem_applied += 1
+
+        # semantic 적용 통계 업데이트
+        if semantic:
+            if debug.get("semantic_applied", False):
+                sem_applied += 1
+            if debug.get("skipped_by_dfidf", False):
+                skipped_by_dfidf += 1
 
         # 결과 상위 K 저장/메트릭
-        top_write = min(100, len(final_order))  # CSV에는 상위 100만 저장
+
         ranked_rel_bin: List[int] = []
+
+        # 순위별 관련성 계산
         for r in range(min(1000, len(final_order))):  # 메트릭용 최대 1000까지 안전
             di = final_order[r]
             rel = 1 if di in rel_set else 0
-            if r < top_write:
-                with open(rankings_path, "a", newline="", encoding="utf-8") as f:
-                    w = csv.writer(f)
-                    doc_txt = documents[di]
-                    if len(doc_txt) > 200:
-                        doc_txt = doc_txt[:200] + "..."
-                    w.writerow([qid, qtext, r + 1, float(final_scores[r]), rel, di, doc_txt])
             ranked_rel_bin.append(rel)
 
         # 메트릭 누적
@@ -475,7 +474,7 @@ def run_benchmark(semantic: bool = False,
 
         total_pairs += min(len(final_order), 1000)
 
-        # semantic jsonl 저장(필터 결과)
+        # semantic jsonl 저장(필터 결과 — 실제로 사용된 토큰 기준)
         if semantic and sem_data and semantic_data_path:
             filtered = debug.get("filtered_terms", {})
             with open(semantic_data_path, "a", encoding="utf-8") as f:
@@ -484,7 +483,6 @@ def run_benchmark(semantic: bool = False,
                     "expanded_keywords": filtered.get("expanded", []),
                     "must_include": filtered.get("must_include", []),
                     "forbidden_terms": filtered.get("forbidden", []),
-
                 }, ensure_ascii=False) + "\n")
 
         # 샘플 로그
@@ -563,7 +561,6 @@ def run_benchmark(semantic: bool = False,
         dbg = meta["semantic_debug"]
         print(f"  sem_applied={dbg['sem_applied']}/{dbg['sem_attempted']}, skipped_by_dfidf={dbg['skipped_by_dfidf']}")
         print(f"  cache_hits={hits}, cache_misses={misses}, cache_size={len(cache)}")
-    print(f" - Rankings: {rankings_path}")
     print(f" - Metrics : {metrics_path}")
 
     return meta

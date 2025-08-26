@@ -9,7 +9,7 @@ def main():
     # run_ms_marco()
     
     # # fiqa 실험 실행
-    # run_fiqa()
+    run_fiqa()
     
     # # banking77 실험 실행
     # run_banking77()
@@ -18,7 +18,7 @@ def main():
     # run_stsb()
     
     # clinc150 실험 실행
-    run_clinc150()
+    # run_clinc150()
 
 if __name__ == "__main__":
     main()

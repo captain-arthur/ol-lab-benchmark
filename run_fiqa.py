@@ -28,26 +28,35 @@ except Exception:
     pass
 
 # --- Semantic rerank config --- [semantic-rerank]
-TOP_R_PURE = 200                # 순정 BM25 상위 후보 수
-TOP_R_SEM = 1000                # semantic BM25 상위 후보 수 (환경변수로 조절)
-ALPHA = 0.5                     # expanded_keywords soft boost
-BETA  = 1.2                     # must_include soft boost
-GAMMA = 1.8                     # forbidden_terms soft penalty (감점)
-EXPANDED_WEIGHT = 0.4           # (현재 사용 안 함: 가산형 보너스만 적용)
-DF_THRESH = 0.80                # DF 필터 임계
-IDF_MIN = 0.1                   # IDF 필터 임계
-MAX_EXPANDED = 8
-MAX_MUST = 3
-SEMANTIC_SAMPLE_RATE = 1.0      # 의미확장 적용 비율
+TOP_R_PURE = 200                                # 순정 BM25 상위 후보 수
+TOP_R_SEM = int(os.getenv("OL_TOP_R_SEM", "1000"))  # semantic 후보 수
+ALPHA = float(os.getenv("OL_ALPHA", "0.5"))     # expanded soft boost (IDF 가중 가산)
 
-try:
-    TOP_R_SEM = int(os.getenv("OL_TOP_R_SEM", str(TOP_R_SEM)))
-except Exception:
-    pass
+# (과거 필드; 현재 미사용)
+# EXPANDED_WEIGHT = 0.4
+
+DF_THRESH = float(os.getenv("OL_DF_THRESH", "0.80"))    # DF 필터 임계
+IDF_MIN   = float(os.getenv("OL_IDF_MIN", "0.1"))       # IDF 필터 임계
+MAX_EXPANDED = int(os.getenv("OL_MAX_EXPANDED", "8"))
+
+SEMANTIC_SAMPLE_RATE = float(os.getenv("OL_SEM_SAMPLE", "1.0"))  # 의미확장 적용 비율 (0~1)
 
 # BM25 파라미터
-K1 = 1.5
-B = 0.75
+K1 = float(os.getenv("OL_BM25_K1", "1.5"))
+B  = float(os.getenv("OL_BM25_B",  "0.75"))
+
+# 앵커/융합 파라미터
+ANCHOR_K = int(os.getenv("OL_ANCHOR_K", "3"))      # BM25 상위 k개는 순서 보호
+RRF_K    = float(os.getenv("OL_RRF_K", "60.0"))    # RRF 결합 상수 (작을수록 재랭크 영향↑)
+
+# 가드레일: 최소한 순정 BM25 global top-100은 포함
+GUARDRAIL_K = int(os.getenv("OL_GUARDRAIL_K", "100"))
+
+# Ollama ENV
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://192.168.45.166:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3")
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "12"))
+OLLAMA_RETRIES = int(os.getenv("OLLAMA_RETRIES", "1"))
 
 
 # -----------------------------
@@ -104,7 +113,7 @@ def map_at_k(ranked_rel: List[int], k: int = 100) -> float:
         if ranked_rel[i] == 1:
             rel_count += 1
             precision_sum += rel_count / (i + 1)
-    return precision_sum / sum(ranked_rel)
+    return precision_sum / max(1, sum(ranked_rel))
 
 def build_idf_dict_from_df(df_dict: Dict[str, int], N: int) -> Dict[str, float]:
     idf_dict: Dict[str, float] = {}
@@ -131,26 +140,28 @@ def build_df_dict(passages: List[str]) -> Dict[str, int]:
 # Semantic Expansion (Ollama gemma3)
 # -----------------------------
 def build_semantic_data_ollama(query: str,
-                               host: str = "http://192.168.45.166:11434",
-                               model: str = "gemma3",
-                               timeout: int = 15,
-                               retries: int = 2) -> Optional[Dict[str, Any]]:
+                               host: str = OLLAMA_HOST,
+                               model: str = OLLAMA_MODEL,
+                               timeout: int = OLLAMA_TIMEOUT,
+                               retries: int = OLLAMA_RETRIES) -> Optional[Dict[str, Any]]:
     prompt = f"""
-You are a data enrichment assistant. Given a user query, produce semantic_data JSON that helps BM25 retrieval.
-Only output valid JSON (no code fences), and keep lists concise but useful.
+Return ONLY a valid JSON object (no code fences). You expand the user query for information retrieval.
 
-Required format:
+Schema:
 {{
   "user_query": "<original query>",
-  "intent_data": {{"language": "en"}},
   "expanded": {{
-    "keywords": ["2-8 short phrases"],
-    "must_include": ["0-3 tokens or short phrases"],
-    "forbidden_terms": ["0-6 tokens or short phrases"]
+    "keywords": ["6-10 short distinct phrases, 2-4 words each, lowercase"]
   }}
 }}
 
-Now produce semantic_data for this query:
+Rules:
+- expanded.keywords must have 6-10 items.
+- Each phrase <=4 words, distinct, lowercase.
+- No filler words (e.g., "and", "from"), no duplicates.
+- No additional fields or commentary.
+
+Now output JSON for:
 "{query}"
 """.strip()
 
@@ -164,12 +175,17 @@ Now produce semantic_data for this query:
             resp.raise_for_status()
             data = resp.json()
             text = (data.get("response") or "").strip()
-            m = re.search(r"\{.*\}", text, re.DOTALL)
-            if not m:
+
+            # 안전한 JSON 추출: 첫 '{' ~ 마지막 '}'
+            first, last = text.find("{"), text.rfind("}")
+            if first == -1 or last == -1:
                 continue
-            obj = json.loads(m.group(0))
-            if "expanded" in obj:
-                return obj
+            obj = json.loads(text[first:last+1])
+            expanded = obj.get("expanded", {}) if isinstance(obj.get("expanded"), dict) else {}
+            return {
+                "query": obj.get("user_query", query),
+                "expanded": {"keywords": expanded.get("keywords", []) or []}
+            }
         except Exception:
             if attempt == retries:
                 return None
@@ -239,6 +255,19 @@ def _filter_sem_tokens(tokens: List[str],
             kept.append(t)
     return dedup(kept)[:limit]
 
+# ---- PRF (RM3-lite) fallback: LLM 없이 확장어 추출 ----
+def prf_rm3_terms(texts: List[str], base_scores_for_cands: np.ndarray,
+                  top_m: int = 20, top_terms: int = 8, min_len: int = 3) -> List[str]:
+    idx = list(range(len(texts)))
+    idx.sort(key=lambda i: float(base_scores_for_cands[i]), reverse=True)
+    idx = idx[:min(top_m, len(idx))]
+    df: Dict[str, int] = {}
+    for i in idx:
+        toks = set([t for t in tokenize_en(texts[i]) if len(t) >= min_len])
+        for t in toks:
+            df[t] = df.get(t, 0) + 1
+    return [t for t, _ in sorted(df.items(), key=lambda x: x[1], reverse=True)[:top_terms]]
+
 
 # -----------------------------
 # Core: per-query scoring & rerank (candidate-level)
@@ -248,24 +277,54 @@ def rerank_on_candidates(query_text: str,
                          documents: List[str],
                          base_scores: np.ndarray,
                          top_r: int,
-                         sem_data: Optional[Dict[str, Any]]) -> Tuple[List[int], List[float], Dict[str, Any]]:
+                         sem_data: Optional[Dict[str, Any]],
+                         allow_semantics: bool) -> Tuple[List[int], List[float], Dict[str, Any]]:
     """
     1) BM25로 전코퍼스 base_scores에서 상위 top_r 후보 인덱스 선택
-    2) semantic 데이터가 있으면 후보 텍스트만으로 DF/IDF, 토큰셋 구성 후 soft 보너스/패널티 적용
+    2) semantic/PRF 데이터가 있으면 후보 텍스트만으로 DF/IDF, 토큰셋 구성 후 soft 보너스 적용
     3) 후보 내에서만 재정렬 → 최종 순서/점수 반환
+    + 가드레일: 전코퍼스 순정 BM25 top-100을 최종 결과에 포함 보장
     """
     N = len(documents)
     cand_idx = list(range(N))
     cand_idx.sort(key=lambda i: base_scores[i], reverse=True)
     cand_idx = cand_idx[:min(top_r, N)]
 
-    debug = {"semantic_applied": False, "filtered_terms": {}, "skipped_by_dfidf": False}
+    # pure 모드 등, 재랭크 비허용 시 BM25 cand 그대로 반환
+    if not allow_semantics:
+        final_local_order = list(range(len(cand_idx)))
+        final_global_order = [cand_idx[i] for i in final_local_order]
 
-    # semantic 미적용이면 그대로
-    if not sem_data:
-        final_local = list(range(len(cand_idx)))
-        final_scores_local = [float(base_scores[i]) for i in cand_idx]
-        return [cand_idx[i] for i in final_local], final_scores_local, debug
+        # --- Recall guardrail: ensure pure BM25 global top-100 are present ---
+        pure_global = list(range(len(base_scores)))
+        pure_global.sort(key=lambda i: base_scores[i], reverse=True)
+        pure_topk_global = pure_global[:GUARDRAIL_K]
+        pure_set = set(pure_topk_global)
+
+        # 유니온
+        seen = set(final_global_order)
+        for i in pure_topk_global:
+            if i not in seen:
+                final_global_order.append(i); seen.add(i)
+
+        # 자르기 전에 BM25 top-100 포함을 강제
+        if len(final_global_order) > GUARDRAIL_K:
+            cur = final_global_order[:GUARDRAIL_K]
+            missing = [i for i in pure_topk_global if i not in set(cur)]
+            if missing:
+                j = GUARDRAIL_K - 1
+                while missing and j >= 0:
+                    if cur[j] not in pure_set:
+                        cur[j] = missing.pop(0)
+                    j -= 1
+            final_global_order = cur
+
+        final_scores_local = [float(base_scores[i]) for i in final_global_order]
+        return final_global_order, final_scores_local, {
+            "semantic_applied": False, "filtered_terms": {}, "skipped_by_dfidf": False
+        }
+
+    debug = {"semantic_applied": False, "filtered_terms": {}, "skipped_by_dfidf": False}
 
     # 후보 텍스트/토큰 기반으로만 DF/IDF·토큰셋 생성
     cand_texts = [documents[i] for i in cand_idx]
@@ -273,51 +332,119 @@ def rerank_on_candidates(query_text: str,
     idf = build_idf_dict_from_df(df_dict, len(cand_texts))
     doc_index = build_doc_token_index(cand_texts)
 
-    # --- 확장어/머스트/금지어: 문구 → 토큰화 후 필터 ---
-    exp = sem_data.get("expanded", {}) or {}
-    expanded_tokens_in = terms_to_tokens(exp.get("keywords", []))
-    must_tokens_in     = terms_to_tokens(exp.get("must_include", []))
-    forbidden_tokens   = terms_to_tokens(exp.get("forbidden_terms", []))
+    # --- 확장어: 문구 → 토큰화 후 필터 ---
+    expanded: List[str] = []
+    if sem_data:
+        exp = sem_data.get("expanded", {}) or {}
+        expanded_tokens_in = terms_to_tokens(exp.get("keywords", []))
+        expanded = _filter_sem_tokens(expanded_tokens_in, df_dict, len(cand_texts), idf, limit=MAX_EXPANDED)
 
-    expanded  = _filter_sem_tokens(expanded_tokens_in, df_dict, len(cand_texts), idf, limit=MAX_EXPANDED)
-    must_inc  = _filter_sem_tokens(must_tokens_in,     df_dict, len(cand_texts), idf, limit=MAX_MUST)
-    forbidden = _filter_sem_tokens(forbidden_tokens,   df_dict, len(cand_texts), idf, limit=32)
+    # ---- PRF fallback: LLM 미스/무효 시 ----
+    if not expanded:
+        prf_terms = prf_rm3_terms(cand_texts, np.array([base_scores[i] for i in cand_idx]),
+                                  top_m=20, top_terms=MAX_EXPANDED)
+        prf_terms = _filter_sem_tokens(prf_terms, df_dict, len(cand_texts), idf, limit=MAX_EXPANDED)
+        if prf_terms:
+            expanded = prf_terms
+            debug["filtered_terms"] = {"expanded": expanded, "fallback": "prf"}
+        else:
+            debug["skipped_by_dfidf"] = True
+            # 최종 순서는 BM25 cand 순서 그대로
+            final_local_order = list(range(len(cand_idx)))
+            final_global_order = [cand_idx[i] for i in final_local_order]
 
-    debug["filtered_terms"] = {"expanded": expanded, "must_include": must_inc, "forbidden": forbidden}
+            # 가드레일 적용(포함 보장 방식)
+            pure_global = list(range(len(base_scores)))
+            pure_global.sort(key=lambda i: base_scores[i], reverse=True)
+            pure_topk_global = pure_global[:GUARDRAIL_K]
+            pure_set = set(pure_topk_global)
 
-    if not expanded and not must_inc and not forbidden:
-        debug["skipped_by_dfidf"] = True
-        final_local = list(range(len(cand_idx)))
-        final_scores_local = [float(base_scores[i]) for i in cand_idx]
-        return [cand_idx[i] for i in final_local], final_scores_local, debug
+            seen = set(final_global_order)
+            for i in pure_topk_global:
+                if i not in seen:
+                    final_global_order.append(i); seen.add(i)
+
+            if len(final_global_order) > GUARDRAIL_K:
+                cur = final_global_order[:GUARDRAIL_K]
+                missing = [i for i in pure_topk_global if i not in set(cur)]
+                if missing:
+                    j = GUARDRAIL_K - 1
+                    while missing and j >= 0:
+                        if cur[j] not in pure_set:
+                            cur[j] = missing.pop(0)
+                        j -= 1
+                final_global_order = cur
+
+            final_scores_local = [float(base_scores[i]) for i in final_global_order]
+            return final_global_order, final_scores_local, debug
 
     debug["semantic_applied"] = True
+    if "filtered_terms" not in debug or not debug["filtered_terms"]:
+        debug["filtered_terms"] = {"expanded": expanded}
 
-    # soft bonus / penalty 계산 (가산형, 비음수/음수)
-    pairs = []
-    for loc, (_tokset, passage) in doc_index.items():
+    # soft bonus 계산 (가산형, 비음수)
+    pairs: List[Tuple[int, float]] = []
+    for loc, (_tokset, _passage) in doc_index.items():
         s = float(base_scores[cand_idx[loc]])
-
-        # expanded, must_include 보너스(IDF 가중)
         for t in expanded:
             if t in _tokset:
                 s += ALPHA * idf.get(t, 0.0)
-        for t in must_inc:
-            if t in _tokset:
-                s += BETA * idf.get(t, 0.0)
-
-        # forbidden 감점
-        for t in forbidden:
-            if t in _tokset:
-                s -= GAMMA * idf.get(t, 0.0)
-
         pairs.append((loc, s))
 
+    # 1차: semantic 가감 점수로 정렬
     pairs.sort(key=lambda x: x[1], reverse=True)
-    final_local_order = [loc for loc, _ in pairs]
-    final_scores_local = [float(score) for _, score in pairs]
+
+    # 2차: RRF 융합(베이스 순위와 가벼운 결합) — 과도한 순위 변동 완충
+    base_rank_map = {
+        loc: rank for rank, loc in enumerate(
+            sorted(range(len(cand_idx)),
+                   key=lambda i: base_scores[cand_idx[i]], reverse=True),
+            start=1
+        )
+    }
+    tmp = []
+    for loc, s_sem in pairs:
+        r_base = base_rank_map[loc]
+        s_rrf = s_sem + 1.0 / (RRF_K + r_base)
+        tmp.append((loc, s_rrf))
+    tmp.sort(key=lambda x: x[1], reverse=True)
+
+    # 3차: 베이스 앵커 보호 — 상위 ANCHOR_K는 원래 BM25 순서를 그대로 유지
+    anchor_locs = sorted(range(len(cand_idx)),
+                         key=lambda i: base_scores[cand_idx[i]], reverse=True)[:ANCHOR_K]
+    anchor_set = set(anchor_locs)
+    tail = [p for p in tmp if p[0] not in anchor_set]
+    final_pairs = [(loc, float(base_scores[cand_idx[loc]])) for loc in anchor_locs] + tail
+
+    final_local_order = [loc for loc, _ in final_pairs]
     final_global_order = [cand_idx[loc] for loc in final_local_order]
 
+    # --- Recall guardrail: ensure pure BM25 global top-100 are present ---
+    pure_global = list(range(len(base_scores)))
+    pure_global.sort(key=lambda i: base_scores[i], reverse=True)
+    pure_topk_global = pure_global[:GUARDRAIL_K]
+    pure_set = set(pure_topk_global)
+
+    # 유니온
+    seen = set(final_global_order)
+    for i in pure_topk_global:
+        if i not in seen:
+            final_global_order.append(i)
+            seen.add(i)
+
+    # 길면 자르되, BM25 top-100 포함 보장 방식으로 자르기
+    if len(final_global_order) > GUARDRAIL_K:
+        cur = final_global_order[:GUARDRAIL_K]
+        missing = [i for i in pure_topk_global if i not in set(cur)]
+        if missing:
+            j = GUARDRAIL_K - 1
+            while missing and j >= 0:
+                if cur[j] not in pure_set:
+                    cur[j] = missing.pop(0)
+                j -= 1
+        final_global_order = cur
+
+    final_scores_local = [float(base_scores[i]) for i in final_global_order]
     return final_global_order, final_scores_local, debug
 
 
@@ -345,7 +472,7 @@ def run_benchmark(semantic: bool = False,
     bm25 = BM25Okapi(tokenized_docs, k1=K1, b=B)
 
     # 캐시 초기화/프리로드
-    cache: Dict[str, Any] = {}
+    cache: List[Dict[str, Any]] = []
     cache_path = None
     semantic_data_path = None
     mode = "semantic" if semantic else "pure"
@@ -359,37 +486,33 @@ def run_benchmark(semantic: bool = False,
         cache_dir = ".cache/keyword/fiqa"
         ensure_dir(cache_dir)
         cache_path = os.path.join(cache_dir, "ollama_cache.json")
+
+        # 기존 캐시 로드 (리스트 스키마 권장)
         if os.path.exists(cache_path):
             try:
-                with open(cache_path, "r", encoding="utf-8") as cf:
-                    cache = json.load(cf)
+                loaded = json.load(open(cache_path, "r", encoding="utf-8"))
+                if isinstance(loaded, list):
+                    cache = loaded
             except Exception:
-                cache = {}
-        # 기존 semantic jsonl → 캐시
+                cache = []
+
+        # 기존 semantic_data.jsonl → 캐시 보강
         if os.path.exists(semantic_data_path):
-            try:
-                with open(semantic_data_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            row = json.loads(line)
-                            q = row.get("query", "")
-                            if not q:
-                                continue
-                            k = _key(q)
-                            if k not in cache:
-                                cache[k] = {
-                                    "user_query": q,
-                                    "intent_data": {"language": "en"},
-                                    "expanded": {
-                                        "keywords": row.get("expanded_keywords", []),
-                                        "must_include": row.get("must_include", []),
-                                        "forbidden_terms": row.get("forbidden_terms", []),
-                                    }
-                                }
-                        except Exception:
+            with open(semantic_data_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                        q = row.get("query", "")
+                        if not q:
                             continue
-            except Exception:
-                pass
+                        ek = []
+                        if isinstance(row.get("expanded"), dict):
+                            ek = row["expanded"].get("keywords", [])
+                        if not ek:
+                            ek = row.get("expanded_keywords", [])
+                        cache.append({"query": q, "expanded": {"keywords": ek}})
+                    except Exception:
+                        continue
 
     # 메트릭 누적
     metrics = {"P@1": 0.0, "P@10": 0.0, "MRR@10": 0.0, "nDCG@10": 0.0, "R@10": 0.0, "R@100": 0.0, "MAP@100": 0.0}
@@ -405,8 +528,6 @@ def run_benchmark(semantic: bool = False,
 
     np.random.seed(42)
     t0 = time.time()
-
-
 
     for qi, q in enumerate(queries, 1):
         qid, qtext = q["query_id"], q["query"]
@@ -426,19 +547,27 @@ def run_benchmark(semantic: bool = False,
         if semantic and (np.random.rand() < SEMANTIC_SAMPLE_RATE):
             sem_attempted += 1
             k = _key(qtext)
-            if k in cache:
-                sem_data = cache[k]
-                hits += 1
-            else:
+            for item in cache:
+                if _key(item.get("query", "")) == k:
+                    sem_data = item
+                    hits += 1
+                    break
+            if sem_data is None:
                 misses += 1
                 sem_data = build_semantic_data_ollama(qtext)
-                if sem_data:  # 생성 성공 시 캐시에 보관
-                    cache[k] = sem_data
+                if sem_data:
+                    cache.append(sem_data)
+                    if cache_path is not None:
+                        try:
+                            json.dump(cache, open(cache_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+                        except Exception:
+                            pass
 
         # 후보 재랭크
-        top_r = TOP_R_SEM if (semantic and sem_data) else TOP_R_PURE
+        allow_sem = bool(semantic and sem_data)  # pure 모드 or sem_data 없음 → 재랭크 비허용
+        top_r = TOP_R_SEM if allow_sem else TOP_R_PURE
         final_order, final_scores, debug = rerank_on_candidates(
-            qtext, bm25, documents, base_scores, top_r, sem_data
+            qtext, bm25, documents, base_scores, top_r, sem_data, allow_semantics=allow_sem
         )
 
         # semantic 적용 통계 업데이트
@@ -448,11 +577,8 @@ def run_benchmark(semantic: bool = False,
             if debug.get("skipped_by_dfidf", False):
                 skipped_by_dfidf += 1
 
-        # 결과 상위 K 저장/메트릭
-
-        ranked_rel_bin: List[int] = []
-
         # 순위별 관련성 계산
+        ranked_rel_bin: List[int] = []
         for r in range(min(1000, len(final_order))):  # 메트릭용 최대 1000까지 안전
             di = final_order[r]
             rel = 1 if di in rel_set else 0
@@ -460,43 +586,33 @@ def run_benchmark(semantic: bool = False,
 
         # 메트릭 누적
         if ranked_rel_bin:
-            metrics["P@1"]  += 1.0 if ranked_rel_bin[0] > 0 else 0.0
-            metrics["P@10"] += sum(ranked_rel_bin[:10]) / 10.0
-            metrics["MRR@10"] += mrr_at_k(ranked_rel_bin, 10)
+            metrics["P@1"]     += 1.0 if ranked_rel_bin[0] > 0 else 0.0
+            metrics["P@10"]    += sum(ranked_rel_bin[:10]) / 10.0
+            metrics["MRR@10"]  += mrr_at_k(ranked_rel_bin, 10)
             metrics["nDCG@10"] += ndcg_at_k(ranked_rel_bin, 10)
             rel_in_top10  = sum(ranked_rel_bin[:10])
             rel_in_top100 = sum(ranked_rel_bin[:100])
-            metrics["R@10"]  += rel_in_top10  / len(rel_set)
-            metrics["R@100"] += rel_in_top100 / len(rel_set)
+            metrics["R@10"]    += rel_in_top10  / len(rel_set)
+            metrics["R@100"]   += rel_in_top100 / len(rel_set)
             metrics["MAP@100"] += map_at_k(ranked_rel_bin, 100)
             if rel_in_top10 == 0:
                 queries_r10_zero += 1
 
         total_pairs += min(len(final_order), 1000)
 
-        # semantic jsonl 저장(필터 결과 — 실제로 사용된 토큰 기준)
+        # semantic jsonl 저장(필터 결과 — 실제 사용된 토큰 기준)
         if semantic and sem_data and semantic_data_path:
             filtered = debug.get("filtered_terms", {})
             with open(semantic_data_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({
                     "query": qtext,
-                    "expanded_keywords": filtered.get("expanded", []),
-                    "must_include": filtered.get("must_include", []),
-                    "forbidden_terms": filtered.get("forbidden", []),
+                    "expanded": {"keywords": filtered.get("expanded", [])},
                 }, ensure_ascii=False) + "\n")
 
         # 샘플 로그
         if qi <= 3:
             sem_used = 'Y' if debug.get("semantic_applied", False) else ('-' if not sem_data else 'N')
             print(f"[{mode}] Q{qi} qid={qid} sem_used={sem_used} top_r={top_r} | rels={len(rel_set)}")
-
-        # 캐시 주기 저장
-        if semantic and cache_path and (qi % 20 == 0):
-            try:
-                with open(cache_path, "w", encoding="utf-8") as cf:
-                    json.dump(cache, cf, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
 
     # 평균화
     if queries_with_rel > 0:
@@ -518,7 +634,8 @@ def run_benchmark(semantic: bool = False,
             "max_queries": max_queries,
             "top_r_pure": TOP_R_PURE,
             "top_r_sem": TOP_R_SEM if semantic else None,
-            "k1": K1, "b": B
+            "k1": K1, "b": B,
+            "anchor_k": ANCHOR_K, "rrf_k": RRF_K, "guardrail_k": GUARDRAIL_K
         }
     }
 
@@ -538,14 +655,14 @@ def run_benchmark(semantic: bool = False,
             "skipped_by_dfidf": skipped_by_dfidf
         }
 
+    ensure_dir(save_dir)
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     # 캐시 저장
     if semantic and cache_path:
         try:
-            with open(cache_path, "w", encoding="utf-8") as cf:
-                json.dump(cache, cf, ensure_ascii=False, indent=2)
+            json.dump(cache, open(cache_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
         except Exception:
             pass
 
@@ -559,7 +676,7 @@ def run_benchmark(semantic: bool = False,
         print(f"  R@10=0 cases: {ra['queries_r10_zero']}/{ra['queries_with_rel']} ({ra['pct_r10_zero']:.1f}%)")
     if semantic and "semantic_debug" in meta:
         dbg = meta["semantic_debug"]
-        print(f"  sem_applied={dbg['sem_applied']}/{dbg['sem_attempted']}, skipped_by_dfidf={dbg['skipped_by_dfidf']}")
+        print(f"  sem_applied={dbg['sem_applied']}/{sem_attempted}, skipped_by_dfidf={dbg['skipped_by_dfidf']}")
         print(f"  cache_hits={hits}, cache_misses={misses}, cache_size={len(cache)}")
     print(f" - Metrics : {metrics_path}")
 

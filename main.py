@@ -6,10 +6,10 @@ from run_clinc150 import run_clinc150
 
 def main():
     # # ms marco 실험 실행
-    # run_ms_marco()
+    run_ms_marco()
     
     # # fiqa 실험 실행
-    run_fiqa()
+    # run_fiqa()
     
     # # banking77 실험 실행
     # run_banking77()

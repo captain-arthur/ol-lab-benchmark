@@ -3,10 +3,11 @@ from run_fiqa import run_fiqa
 from run_banking77 import run_banking77
 from run_stsb import run_stsb
 from run_clinc150 import run_clinc150
+from run_llm import run_lllmI
 
 def main():
     # # ms marco 실험 실행
-    run_ms_marco()
+    # run_ms_marco()
     
     # # fiqa 실험 실행
     # run_fiqa()
@@ -19,6 +20,9 @@ def main():
     
     # clinc150 실험 실행
     # run_clinc150()
+    
+    # llm 실험 실행
+    run_lllmI()
 
 if __name__ == "__main__":
     main()

@@ -11,4 +11,5 @@ dependencies = [
     "rank-bm25",
     "requests>=2.32.4",
     "sentence-transformers",
+    "setfit>=1.1.3",
 ]

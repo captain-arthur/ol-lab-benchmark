@@ -1,2 +1,30 @@
+# Results and cache directories
 results/
+.cache/
+checkpoints/
+
+# Python cache
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Log files
+*.log
+
+# Test files
+test_*.py
+
+# Environment
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

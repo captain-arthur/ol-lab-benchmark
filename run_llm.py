@@ -59,7 +59,7 @@ except Exception:
 # Global config
 # ===============================
 SEED = 42
-MAX_QUERIES = 5
+MAX_QUERIES = 20
 
 # 라우팅 임계값 옵션 (환경변수로 설정 가능)
 THETA = float(os.getenv("OL_THETA", "0.65"))  # routing threshold (balanced performance from test_semantic_collection.py)
@@ -88,6 +88,67 @@ CACHE_DIR = ".cache/llm_filter"
 # ===============================
 # Utilities
 # ===============================
+def pearson_spearman(preds: List[float], golds: List[float]) -> Dict[str, float]:
+    """Pearson과 Spearman 상관계수 계산 (개선된 버전)"""
+    if len(preds) < 2 or len(golds) < 2:
+        return {"pearson": 0.0, "spearman": 0.0}
+    
+    # 상수 입력 체크
+    if len(set(preds)) <= 1 or len(set(golds)) <= 1:
+        return {"pearson": 0.0, "spearman": 0.0}
+    
+    try:
+        from scipy.stats import pearsonr, spearmanr
+        pearson_corr, _ = pearsonr(preds, golds)
+        spearman_corr, _ = spearmanr(preds, golds)
+        return {
+            "pearson": float(pearson_corr),
+            "spearman": float(spearman_corr)
+        }
+    except ImportError:
+        # scipy가 없으면 간단한 상관계수 계산
+        n = len(preds)
+        if n < 2:
+            return {"pearson": 0.0, "spearman": 0.0}
+        
+        # Pearson 상관계수
+        mean_pred = sum(preds) / n
+        mean_gold = sum(golds) / n
+        
+        numerator = sum((p - mean_pred) * (g - mean_gold) for p, g in zip(preds, golds))
+        denom_pred = sum((p - mean_pred) ** 2 for p in preds)
+        denom_gold = sum((g - mean_gold) ** 2 for g in golds)
+        
+        if denom_pred == 0 or denom_gold == 0:
+            pearson = 0.0
+        else:
+            pearson = numerator / (denom_pred * denom_gold) ** 0.5
+        
+        # Spearman 상관계수 (순위 기반)
+        def rank_data(data):
+            sorted_data = sorted(enumerate(data), key=lambda x: x[1])
+            ranks = [0] * len(data)
+            for rank, (idx, _) in enumerate(sorted_data):
+                ranks[idx] = rank + 1
+            return ranks
+        
+        pred_ranks = rank_data(preds)
+        gold_ranks = rank_data(golds)
+        
+        mean_pred_rank = sum(pred_ranks) / n
+        mean_gold_rank = sum(gold_ranks) / n
+        
+        numerator = sum((p - mean_pred_rank) * (g - mean_gold_rank) for p, g in zip(pred_ranks, gold_ranks))
+        denom_pred = sum((p - mean_pred_rank) ** 2 for p in pred_ranks)
+        denom_gold = sum((g - mean_gold_rank) ** 2 for g in gold_ranks)
+        
+        if denom_pred == 0 or denom_gold == 0:
+            spearman = 0.0
+        else:
+            spearman = numerator / (denom_pred * denom_gold) ** 0.5
+        
+        return {"pearson": float(pearson), "spearman": float(spearman)}
+
 def set_seed(seed: int = SEED):
     random.seed(seed)
     try:
@@ -309,6 +370,34 @@ Most relevant passage number:"""
 
 
 # ===============================
+# Evaluation metrics
+# ===============================
+def pearson_spearman(preds: List[float], golds: List[float]) -> Dict[str, float]:
+    """Pearson과 Spearman 상관계수 계산"""
+    try:
+        import numpy as np
+        from scipy.stats import pearsonr, spearmanr
+        
+        if len(preds) != len(golds) or len(preds) < 2:
+            return {"pearson": 0.0, "spearman": 0.0}
+        
+        # 문자열을 실수로 변환
+        pred_vals = [float(p) if isinstance(p, str) else p for p in preds]
+        gold_vals = [float(g) if isinstance(g, str) else g for g in golds]
+        
+        # 상관계수 계산
+        pearson_corr, _ = pearsonr(pred_vals, gold_vals)
+        spearman_corr, _ = spearmanr(pred_vals, gold_vals)
+        
+        return {
+            "pearson": float(pearson_corr) if not np.isnan(pearson_corr) else 0.0,
+            "spearman": float(spearman_corr) if not np.isnan(spearman_corr) else 0.0
+        }
+    except Exception as e:
+        print(f"상관계수 계산 실패: {e}")
+        return {"pearson": 0.0, "spearman": 0.0}
+
+# ===============================
 # Heuristic confidence extractor
 # ===============================
 def extract_confidence_simple(response: str, base: float = 0.65) -> float:
@@ -349,18 +438,7 @@ def extract_confidence_simple(response: str, base: float = 0.65) -> float:
         if indicator in response_lower:
             return 0.4
     
-    # 응답 길이 기반 추정 (더 세밀한 구분)
-    response_len = len(response.strip())
-    if response_len < 10:
-        return 0.85  # 매우 짧은 응답은 높은 신뢰도
-    elif response_len < 30:
-        return 0.75  # 짧은 응답
-    elif response_len < 100:
-        return 0.65  # 중간 길이
-    else:
-        return 0.55  # 긴 응답은 불확실성 증가
-    
-    # 기본값은 base 사용
+    # 응답 길이 기반 휴리스틱 제거 - 단순 base 반환
     return base
 
 
@@ -478,9 +556,9 @@ def load_stsb(max_q=MAX_QUERIES):
     print(f"[STSB] Loaded {len(X)} samples with {len(set(Y))} unique labels")
     return X, Y, {"task":"reg", "name":"stsb", "labels": ["0", "1", "2", "3", "4", "5"]}
 
-# 검색 태스크를 위한 간단한 데이터 로딩 (MS MARCO 스타일)
-def load_ms_marco_simple(max_q=MAX_QUERIES):
-    """MS MARCO 검색 태스크 (간단한 버전)"""
+ # 랭킹 태스크를 위한 MS MARCO 데이터 로딩
+def load_ms_marco_ranking(max_q=MAX_QUERIES):
+    """MS MARCO 랭킹 태스크"""
     if load_dataset is None:
         raise RuntimeError("datasets not installed")
     
@@ -489,8 +567,8 @@ def load_ms_marco_simple(max_q=MAX_QUERIES):
     except Exception as e:
         print(f"Error loading MS MARCO dataset: {e}")
         raise
-
-    X, Y = [], []
+    
+    queries, gold_indices, candidates_list = [], [], []
     query_count = 0
     
     for ex in ds:
@@ -498,22 +576,72 @@ def load_ms_marco_simple(max_q=MAX_QUERIES):
             break
             
         query = ex.get("query", "")
-        passages = ex.get("passages", {}).get("passage_text", [])
-        relevant_passages = ex.get("relevant_passages", [])
+        passages = ex.get("passages", {})
+        passage_texts = passages.get("passage_text", [])
+        is_selected = passages.get("is_selected", [])
         
-        if not query or not passages:
+        if not query or not passage_texts:
             continue
-            
-        # 간단한 검색 시뮬레이션: 쿼리와 가장 유사한 패시지 찾기
-        # 실제로는 더 복잡한 검색 로직이 필요
-        X.append(query)
-        Y.append("search_task")  # 검색 태스크임을 표시
-        query_count += 1
+        
+        # 관련 패시지가 있는 쿼리만 선택
+        relevant_indices = [j for j, selected in enumerate(is_selected) if selected == 1]
+        if relevant_indices:
+            # 상위 10개 패시지만 사용 (랭킹 태스크)
+            top_passages = passage_texts[:10]
+            if len(top_passages) >= 3:  # 최소 3개 패시지 필요
+                queries.append(query)
+                # 첫 번째 관련 패시지의 인덱스 (0-based)
+                gold_idx = relevant_indices[0] if relevant_indices else 0
+                gold_indices.append(gold_idx)
+                candidates_list.append(top_passages)
+                query_count += 1
     
-    print(f"[MS_MARCO] Loaded {len(X)} queries for search task")
-    return X, Y, {"task":"search", "name":"ms_marco", "labels": ["search"]}
+    print(f"[MS_MARCO] Loaded {len(queries)} queries with {len(candidates_list[0]) if candidates_list else 0} candidates each for ranking task")
+    
+    # 기존 형식과 호환되도록 X, Y 형태로 변환
+    X = queries
+    Y = [str(idx) for idx in gold_indices]  # 문자열로 변환
+    
+    return X, Y, {"task":"rank", "name":"ms_marco", "candidates": candidates_list, "gold_indices": gold_indices}
 
-DATASETS = [load_banking77, load_clinc150, load_stsb, load_ms_marco_simple]
+# 검색 태스크를 위한 개선된 데이터 로딩 (MS MARCO) - 기존 호환성 유지
+def load_ms_marco_simple(max_q=MAX_QUERIES):
+     """MS MARCO 검색 태스크 (개선된 버전)"""
+     if load_dataset is None:
+         raise RuntimeError("datasets not installed")
+     
+     try:
+         ds = load_dataset("ms_marco", "v2.1", split="validation")
+     except Exception as e:
+         print(f"Error loading MS MARCO dataset: {e}")
+         raise
+     
+     X, Y = [], []
+     query_count = 0
+     
+     for ex in ds:
+         if query_count >= max_q:
+             break
+             
+         query = ex.get("query", "")
+         passages = ex.get("passages", {})
+         passage_texts = passages.get("passage_text", [])
+         is_selected = passages.get("is_selected", [])
+         
+         if not query or not passage_texts:
+             continue
+         
+         # 관련 패시지가 있는 쿼리만 선택
+         relevant_indices = [j for j, selected in enumerate(is_selected) if selected == 1]
+         if relevant_indices:
+             X.append(query)
+             Y.append("search_task")  # 검색 태스크임을 표시
+             query_count += 1
+     
+     print(f"[MS_MARCO] Loaded {len(X)} queries with relevant passages for search task")
+     return X, Y, {"task":"search", "name":"ms_marco", "labels": ["search"]}
+
+DATASETS = [load_banking77, load_clinc150, load_stsb, load_ms_marco_ranking]
 
 
 # ===============================
@@ -634,25 +762,83 @@ def predict_stsb(client, cache, model, text_block) -> Tuple[str, float, Dict[str
     
     return lab, conf, usage, out
 
-def predict_search_simple(client, cache, model, query: str) -> Tuple[str, float, Dict[str,Any], str]:
-    """검색 태스크 간단한 예측 (시뮬레이션)"""
-    # 간단한 검색 시뮬레이션
-    prompt = f"Search Query: {query}\n\nFind the most relevant information. Return 'relevant' or 'not_relevant'."
+def predict_ms_marco_ranking(client, cache, model, query: str, candidates: List[str]) -> Tuple[str, float, Dict[str,Any], str]:
+    """MS MARCO 랭킹 태스크 예측"""
+    # 후보 패시지들을 번호와 함께 제시
+    prompt = f"""Ranking Task: Given a query and candidate passages, select the most relevant passage.
+
+Query: {query}
+
+Candidate Passages:
+"""
+    
+    for i, passage in enumerate(candidates, 1):
+        # 패시지 길이 제한
+        short_passage = passage[:200] + "..." if len(passage) > 200 else passage
+        prompt += f"{i}. {short_passage}\n"
+    
+    prompt += f"""
+Instructions:
+- Return ONLY the number (1-{len(candidates)}) of the most relevant passage
+- Consider relevance, accuracy, and completeness
+- If no passage is relevant, return 1
+
+Most relevant passage number:"""
+    
     out, usage = ollama_cached_call(client, cache, model, prompt)
     
-    # 간단한 응답 파싱
-    out_lower = out.lower()
-    if 'relevant' in out_lower:
-        lab = "relevant"
+    # 응답 파싱 (1-based 인덱스를 0-based로 변환)
+    import re
+    numbers = re.findall(r'\b(\d+)\b', out)
+    if numbers:
+        try:
+            pred_idx = int(numbers[0]) - 1  # 1-based -> 0-based
+            if 0 <= pred_idx < len(candidates):
+                lab = str(pred_idx)
+            else:
+                lab = "0"  # 범위를 벗어나면 기본값
+        except:
+            lab = "0"
     else:
-        lab = "not_relevant"
+        lab = "0"
     
     conf = extract_confidence_simple(out, base=0.70)
     return lab, conf, usage, out
 
+def predict_search_simple(client, cache, model, query: str) -> Tuple[str, float, Dict[str,Any], str]:
+     """검색 태스크 개선된 예측 (BM25 기반)"""
+     # BM25 검색 시뮬레이션
+     prompt = f"""Search Query: {query}
+
+Based on the query, determine if this is a search task that requires finding relevant information.
+
+Return ONLY one of:
+- "search" (if this is a search query)
+- "not_search" (if this is not a search query)
+
+Consider:
+- Information seeking queries (what, how, why, when, where)
+- Fact-finding questions
+- Research queries
+- General knowledge questions
+
+Response:"""
+     
+     out, usage = ollama_cached_call(client, cache, model, prompt)
+     
+     # 응답 파싱
+     out_lower = out.lower().strip()
+     if 'search' in out_lower and 'not_search' not in out_lower:
+         lab = "search"
+     else:
+         lab = "not_search"
+     
+     conf = extract_confidence_simple(out, base=0.70)
+     return lab, conf, usage, out
+
 def predict_task(client, cache, model, meta, text):
     name = meta["name"]
-    labels = meta["labels"]
+    labels = meta.get("labels", [])  # labels가 없을 수 있음
     if name == "banking77":
         return predict_bank(client, cache, model, text, labels)
     elif name == "clinc150":
@@ -660,7 +846,18 @@ def predict_task(client, cache, model, meta, text):
     elif name == "stsb":
         return predict_stsb(client, cache, model, text)
     elif name == "ms_marco":
-        # 검색 태스크는 간단한 시뮬레이션
+        # 태스크 타입에 따라 분기
+        if meta["task"] == "rank":
+            # 랭킹 태스크: 후보 패시지들과 함께 예측
+            candidates = meta.get("candidates", [])
+            if candidates:
+                # 현재 쿼리에 해당하는 후보들 찾기
+                query_idx = len([x for x in meta.get("processed_queries", []) if x == text])
+                if query_idx < len(candidates):
+                    return predict_ms_marco_ranking(client, cache, model, text, candidates[query_idx])
+            # 후보가 없으면 기본 검색 태스크로 폴백
+            return predict_search_simple(client, cache, model, text)
+        # 기본 검색 태스크
         return predict_search_simple(client, cache, model, text)
     else:
         # generic classifier
@@ -673,10 +870,376 @@ def predict_task(client, cache, model, meta, text):
         conf = extract_confidence_simple(out, base=0.65)
         return lab, conf, usage, out
 
+def predict_task_with_rationale(client, cache, model, meta, text):
+    """개선된 라이트 LLM 예측 - 근거 스팬 포함"""
+    name = meta["name"]
+    labels = meta.get("labels", [])  # labels가 없을 수 있음
+    
+    # 개선된 프롬프트 (근거 스팬 추출 포함)
+    prompt = f"""Task: Classify the input text and provide reasoning.
+
+Input: {text}
+Labels: {', '.join(labels[:30])}
+
+Return JSON with fields:
+- label: <exact label from the list>
+- confidence: 0.0-1.0 (your confidence in the classification)
+- rationale_span: <exact substring from input that justifies your decision, max 100 chars>
+
+JSON:"""
+    
+    out, usage = ollama_cached_call(client, cache, model, prompt)
+    
+    try:
+        # JSON 파싱 시도
+        import json
+        result = json.loads(out.strip())
+        lab = result.get("label", "")
+        conf = float(result.get("confidence", 0.65))
+        rationale = result.get("rationale_span", text[:50])
+    except:
+        # JSON 파싱 실패시 기존 방식 사용
+        raw = parse_label_only(out)
+        lab = nearest_label(raw, labels)
+        conf = extract_confidence_simple(out, base=0.65)
+        rationale = text[:50]  # 기본값
+    
+    return lab, conf, usage, out, rationale
+
 
 # ===============================
 # CBC Verifier
 # ===============================
+class CBCVerifierV2:
+    """개선된 CBC 검증기 - 이중 임계값 기반 3단계 게이팅"""
+    
+    def __init__(self, client, dataset_name: str = "banking77", use_setfit: bool = True, k_proto=5):
+        self.client = client
+        self.dataset_name = dataset_name
+        self.use_setfit = use_setfit and (SetFitModel is not None and torch is not None and np is not None)
+        self.k_proto = k_proto
+        self.proto_by_label = defaultdict(list)  # label -> list[str]
+        self.embed_model = None
+        
+        # 도메인별 설정
+        if dataset_name == "banking77":
+            self.tau_low = 0.40
+            self.tau_high = 0.70
+            self.w_anchor = 0.2
+            self.w_proto = 0.4
+            self.w_nli = 0.4
+        else:  # CLINC150, STSB, MS_MARCO
+            self.tau_low = 0.55
+            self.tau_high = 0.80
+            self.w_anchor = 0.15
+            self.w_proto = 0.35
+            self.w_nli = 0.50
+        
+        # NLI 모델 초기화
+        self.nli_model = None
+        self.nli_tokenizer = None
+        self._init_nli_model()
+        
+        # 프로토타입 초기화
+        self._init_prototypes()
+        
+        # 라벨 글로스
+        self.label_gloss = self._get_label_gloss()
+        
+        print(f"[CBCv2] Initialized for {dataset_name}")
+        print(f"[CBCv2] Weights: anchor={self.w_anchor}, proto={self.w_proto}, nli={self.w_nli}")
+        print(f"[CBCv2] Thresholds: low={self.tau_low}, high={self.tau_high}")
+    
+    def _init_nli_model(self):
+        """NLI 모델 초기화 (MNLI 모델 + 자동 레이블 인덱스)"""
+        try:
+            from transformers import AutoTokenizer, AutoModelForSequenceClassification
+            model_name = "roberta-large-mnli"  # MNLI 파인튜닝된 모델
+            self.nli_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.nli_model = AutoModelForSequenceClassification.from_pretrained(model_name)
+            
+            # ENTAILMENT 레이블 인덱스 자동 찾기
+            self.entailment_index = None
+            if hasattr(self.nli_model.config, 'id2label'):
+                for idx, label in self.nli_model.config.id2label.items():
+                    if label == "ENTAILMENT":
+                        self.entailment_index = int(idx)
+                        break
+            
+            if self.entailment_index is None:
+                # 기본값 (roberta-large-mnli의 경우)
+                self.entailment_index = 2
+            
+            print(f"[CBCv2] NLI model loaded: {model_name}")
+            print(f"[CBCv2] ENTAILMENT index: {self.entailment_index}")
+        except Exception as e:
+            print(f"[CBCv2] NLI model failed: {e}")
+            self.nli_model = None
+            self.entailment_index = 2  # 폴백
+    
+    def _init_prototypes(self):
+        """프로토타입 초기화"""
+        if self.dataset_name == "banking77":
+            self.proto_by_label = {
+                "card_arrival": [
+                    "I haven't received my card yet",
+                    "When will my card arrive",
+                    "Card delivery status"
+                ],
+                "card_not_working": [
+                    "My card doesn't work",
+                    "Card declined",
+                    "Card activation issues"
+                ],
+                "activate_my_card": [
+                    "How to activate my card",
+                    "Card activation process",
+                    "Activate new card"
+                ]
+            }
+        elif self.dataset_name == "clinc150":
+            self.proto_by_label = {
+                "0": ["translate", "language", "italian"],
+                "1": ["money transfer", "banking", "financial"],
+                "2": ["timer", "alarm", "reminder"]
+            }
+    
+    def _get_label_gloss(self) -> Dict[str, str]:
+        """라벨 글로스 반환"""
+        if self.dataset_name == "banking77":
+            return {
+                "card_arrival": "카드 도착 및 배송 관련 문의",
+                "card_not_working": "카드 사용 불가 및 오류",
+                "activate_my_card": "카드 활성화 및 인증",
+                "passcode_forgotten": "비밀번호 분실 및 재설정",
+                "age_limit": "연령 제한 및 자격 확인"
+            }
+        elif self.dataset_name == "clinc150":
+            return {
+                "0": "번역 및 언어 관련",
+                "1": "금융 및 송금",
+                "2": "타이머 및 알람"
+            }
+        return {}
+    
+    def _extract_anchors(self, text: str, topk: int = 5) -> List[str]:
+        """입력 텍스트에서 핵심 토큰 추출 (스톱워드 제외)"""
+        # 스톱워드 리스트
+        stopwords = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+            'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+            'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+            'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those',
+            'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them'
+        }
+        
+        # 토큰화 및 빈도 계산
+        toks = re.findall(r"[a-zA-Z0-9]+", (text or "").lower())
+        ctr = Counter(toks)
+        
+        # 스톱워드 제외하고 top-k 추출
+        anchors = []
+        for word, count in ctr.most_common():
+            if len(anchors) >= topk:
+                break
+            if word not in stopwords and len(word) >= 3:
+                anchors.append(word)
+        
+        return anchors
+    
+    def _anchor_score(self, query: str, rationale_span: str, label_gloss: str = "") -> float:
+        """앵커 점수: 쿼리 핵심 키워드와 근거 스팬의 겹침률 (라벨 글로스 활용)"""
+        query_anchors = self._extract_anchors(query)
+        rationale_anchors = self._extract_anchors(rationale_span)
+        
+        # 라벨 글로스 활용
+        if label_gloss:
+            gloss_anchors = self._extract_anchors(label_gloss)
+            rationale_anchors.extend(gloss_anchors)
+        
+        if not query_anchors:
+            return 0.0
+        
+        # 겹침 계산
+        query_set = set(query_anchors)
+        rationale_set = set(rationale_anchors)
+        overlap = len(query_set & rationale_set)
+        
+        return overlap / len(query_anchors)
+    
+    def _ensure_embedder(self):
+        """임베딩 모델 초기화"""
+        if self.embed_model is None and self.use_setfit:
+            try:
+                self.embed_model = SetFitModel.from_pretrained("sentence-transformers/paraphrase-mpnet-base-v2")
+                print("[CBCv2] SetFit embedder loaded")
+            except Exception as e:
+                print(f"[CBCv2] SetFit embedder failed: {e}")
+                self.embed_model = None
+    
+    def _embed(self, texts: List[str]):
+        """텍스트 임베딩"""
+        self._ensure_embedder()
+        if self.embed_model is None or not texts:
+            return None
+        try:
+            with torch.no_grad():
+                v = self.embed_model.model_body.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+            return v
+        except Exception as e:
+            print(f"[CBCv2] Embedding failed: {e}")
+            return None
+    
+    def _proto_score(self, label: str, query: str, passage: str) -> float:
+        """프로토타입 유사도 점수 (q와 프로토타입 코사인 유사도 평균)"""
+        protos = self.proto_by_label.get(label, [])
+        if not protos:
+            return 0.0
+        
+        if self.embed_model is not None:
+            # 임베딩 기반 코사인 유사도
+            Vq = self._embed([query])
+            Vp = self._embed(protos[:self.k_proto])
+            
+            if Vq is not None and Vp is not None:
+                # 쿼리와 프로토타입 간 코사인 유사도
+                sims = Vp @ Vq[0]
+                return float(np.mean(sims)) if len(sims) else 0.0
+        
+        # Fallback: 토큰 겹침
+        query_tokens = set(self._extract_anchors(query, 20))
+        sims = []
+        for proto in protos[:self.k_proto]:
+            proto_tokens = set(self._extract_anchors(proto, 20))
+            overlap = len(query_tokens & proto_tokens)
+            sim = overlap / max(1, len(query_tokens))
+            sims.append(sim)
+        
+        return float(np.mean(sims)) if sims else 0.0
+    
+    def _nli_score(self, premise: str, hypothesis: str) -> float:
+        """NLI 점수: premise가 hypothesis를 함의하는지 (ENTAIL 확률)"""
+        if not premise or not hypothesis:
+            return 0.0
+        
+        if self.nli_model is not None and self.nli_tokenizer is not None:
+            try:
+                # NLI 모델 추론
+                inputs = self.nli_tokenizer(
+                    premise, hypothesis, 
+                    return_tensors="pt", 
+                    truncation=True, 
+                    max_length=512
+                )
+                
+                with torch.no_grad():
+                    outputs = self.nli_model(**inputs)
+                    probs = torch.softmax(outputs.logits, dim=1)
+                    
+                # ENTAILMENT 확률 반환 (자동 인덱스)
+                entail_prob = float(probs[0][self.entailment_index])
+                return entail_prob
+                
+            except Exception as e:
+                print(f"[CBCv2] NLI inference failed: {e}")
+        
+        # Fallback: 키워드 매칭 (개선된 버전)
+        premise_words = set(self._extract_anchors(premise, 20))
+        hypothesis_words = set(self._extract_anchors(hypothesis, 20))
+        
+        if not hypothesis_words:
+            return 0.0
+        
+        # 겹침 비율에 따른 점수 (더 정교한 계산)
+        overlap = len(premise_words & hypothesis_words)
+        ratio = overlap / len(hypothesis_words)
+        
+        if ratio >= 0.6:
+            return 1.0
+        elif ratio >= 0.4:
+            return 0.8
+        elif ratio >= 0.2:
+            return 0.6
+        elif ratio >= 0.1:
+            return 0.3
+        else:
+            return 0.0
+    
+    def update_prototypes(self, label: str, text: str):
+        """프로토타입 업데이트"""
+        if not label or not text:
+            return
+        
+        # 라벨이 없으면 초기화
+        if label not in self.proto_by_label:
+            self.proto_by_label[label] = []
+        
+        arr = self.proto_by_label[label]
+        arr.append(text)
+        if len(arr) > (self.k_proto * 3):
+            self.proto_by_label[label] = arr[-(self.k_proto * 3):]  # keep tail
+    
+    def verify(self, query: str, passage: str, lite_pred: str, 
+               lite_rationale: str, lite_conf: float, 
+               label_gloss: str = "", anchor_sentence: str = "") -> dict:
+        """CBC 검증 수행 (개선된 로직)"""
+        
+        # 라벨 글로스 가져오기
+        if not label_gloss and lite_pred in self.label_gloss:
+            label_gloss = self.label_gloss[lite_pred]
+        
+        # 앵커 문장이 없으면 rationale 사용
+        if not anchor_sentence:
+            anchor_sentence = lite_rationale
+        
+        # 1. 앵커 점수: 쿼리 핵심 키워드와 근거 스팬의 겹침률 (라벨 글로스 활용)
+        anchor_score = self._anchor_score(query, anchor_sentence, label_gloss)
+        
+        # 2. 프로토타입 유사도: 쿼리와 프로토타입 코사인 유사도 평균
+        proto_score = self._proto_score(lite_pred, query, passage)
+        
+        # 3. NLI 점수: 근거 스팬이 쿼리의 의도를 지원하는지
+        premise = lite_rationale if lite_rationale else passage
+        hypothesis = f"This text supports the query: {query}"
+        nli_score = self._nli_score(premise, hypothesis)
+        
+        # 4. 종합 점수
+        cbc_score = (self.w_anchor * anchor_score + 
+                    self.w_proto * proto_score + 
+                    self.w_nli * nli_score)
+        
+        # 5. 3단계 게이팅 결정 (이중 임계값 기반)
+        if cbc_score < self.tau_low:
+            action = "block"
+            reason = "cbc_low"
+        elif cbc_score >= self.tau_high and lite_conf >= THETA:
+            action = "keep_light"
+            reason = "cbc_high"
+        else:
+            action = "promote_heavy"
+            reason = "boundary"
+        
+        # 6. 최종 신뢰도 계산 (개선된 공식)
+        final_conf = min(lite_conf * (0.5 + 0.5 * cbc_score), 0.95)
+        
+        return {
+            "score": cbc_score,
+            "pass": cbc_score >= self.tau_low,
+            "parts": {
+                "anchor": anchor_score,
+                "proto": proto_score,
+                "nli": nli_score
+            },
+            "action": action,
+            "reason": reason,
+            "final_conf": final_conf,
+            "weights": {
+                "anchor": self.w_anchor,
+                "proto": self.w_proto,
+                "nli": self.w_nli
+            }
+        }
+
 class CBCVerifier:
     """Claim-Backed Confidence 검증기"""
     
@@ -1077,6 +1640,47 @@ def map_at_k(ranked_rel: List[int], k: int = 100) -> float:
             precision_sum += rel_count / (i + 1)
     return precision_sum / max(1, sum(ranked_rel))
 
+def ranking_metrics(predictions: List[str], gold_indices: List[int], k: int = 10) -> Dict[str, float]:
+    """랭킹 메트릭 계산"""
+    if not predictions or not gold_indices:
+        return {
+            f"P@{k}": 0.0,
+            f"nDCG@{k}": 0.0,
+            f"MRR@{k}": 0.0
+        }
+    
+    p_at_k = []
+    ndcg_at_k = []
+    mrr = []
+    
+    for pred_str, gold_idx in zip(predictions, gold_indices):
+        try:
+            pred_rank = int(pred_str)
+        except:
+            pred_rank = 0
+        
+        # P@k
+        p_at_k.append(1.0 if pred_rank < k else 0.0)
+        
+        # nDCG@k
+        if pred_rank < k:
+            ndcg = 1.0 / np.log2(pred_rank + 2)  # +2 because log2(1) = 0
+        else:
+            ndcg = 0.0
+        ndcg_at_k.append(ndcg)
+        
+        # MRR
+        if pred_rank < k:
+            mrr.append(1.0 / (pred_rank + 1))
+        else:
+            mrr.append(0.0)
+    
+    return {
+        f"P@{k}": np.mean(p_at_k),
+        f"nDCG@{k}": np.mean(ndcg_at_k),
+        f"MRR@{k}": np.mean(mrr)
+    }
+
 def search_metrics(predictions: List[str], gold_labels: List[str]) -> Dict[str, float]:
     """검색 태스크 지표 계산 (완전한 검색 지표)"""
     if not predictions or not gold_labels:
@@ -1129,6 +1733,7 @@ def run_on_dataset(arm: str,
 
     is_cls = meta["task"] == "cls"
     is_search = meta["task"] == "search"
+    is_rank = meta["task"] == "rank"
     name   = meta["name"]
     labels_all = meta.get("labels", [])
 
@@ -1147,7 +1752,7 @@ def run_on_dataset(arm: str,
     # CBC (D-arms only)
     cbc = None
     if arm == "D_cbc_enhanced":
-        cbc = CBCVerifier(client)
+        cbc = CBCVerifierV2(client, dataset_name=name, use_setfit=True)
 
     # Warmup teacher (allow heavy for warmup only)
     if sf is not None and sf.model is None and WARMUP_K > 0:
@@ -1204,8 +1809,14 @@ def run_on_dataset(arm: str,
                 print(f"   Gold: '{gold}' | Output: '{pred}' | Acc: {correct}")
             continue
 
-        # Step 1: Light pass
-        lite_pred, lite_conf, uL, rawL = predict_task(client, cache, GEMMA_LITE, meta, inp)
+        # Step 1: Light pass (개선된 버전 - 근거 스팬 포함)
+        if cbc is not None:
+            # CBC가 있는 경우 근거 스팬도 추출
+            lite_pred, lite_conf, uL, rawL, lite_rationale = predict_task_with_rationale(client, cache, GEMMA_LITE, meta, inp)
+        else:
+            # 기존 방식
+            lite_pred, lite_conf, uL, rawL = predict_task(client, cache, GEMMA_LITE, meta, inp)
+            lite_rationale = inp[:min(100, len(inp))]  # 기본값
 
         # Step 2: SetFit filtering / CBC verification
         conf_mode = "lite_only"
@@ -1230,19 +1841,54 @@ def run_on_dataset(arm: str,
         
         # Step 2.5: CBC verification (D_cbc_enhanced only)
         if cbc is not None:
-            # CBC 검증을 위한 증거 생성 (실제로는 외부 지식베이스에서 가져와야 함)
-            evidence = f"사용자 질문: {inp}\n경량 LLM 응답: {lite_pred}"
+            # 개선된 CBC 검증 (근거 스팬 기반)
+            cbc_result = cbc.verify(
+                query=inp,
+                passage=inp,  # 간단히 입력을 패시지로 사용
+                lite_pred=lite_pred,
+                lite_rationale=lite_rationale,
+                lite_conf=lite_conf
+            )
             
-            # CBC 검증 실행
-            cbc_result = cbc.verify_claim(lite_pred, evidence, base_conf)
-            base_conf = cbc_result["final_confidence"]
+            # 개선된 게이팅 로직 (이중 임계값 기반)
+            if cbc_result["action"] == "block":
+                # 근거 부실 → 차단 (수집 NO)
+                called_heavy = False
+                heavy_reason = "cbc_block"
+                final_pred = "NO_COLLECT"
+                final_conf = 0.0
+            elif cbc_result["action"] == "keep_light":
+                # 라이트 확정 (개선된 신뢰도 사용)
+                called_heavy = False
+                heavy_reason = "cbc_keep_light"
+                final_pred = lite_pred
+                final_conf = cbc_result["final_conf"]  # 개선된 신뢰도 계산식 사용
+            else:  # promote_heavy
+                # 헤비 승급
+                called_heavy = True
+                heavy_reason = "cbc_promote_heavy"
+            
             conf_mode = "cbc_verified"
+            
+            # 프로토타입 업데이트 (라벨별 온라인 축적)
+            cbc.update_prototypes(lite_pred, inp)
 
         # Step 3: Routing
         if conf_mode == "setfit_filter":
             # SetFit이 이해한 경우 - 이미 final_pred 설정됨, final_conf 추가 설정
             called_heavy = False
             final_conf = base_conf
+        elif conf_mode == "cbc_verified":
+            # CBC 검증 결과에 따른 라우팅
+            if called_heavy:
+                pred, _, uH, rawH = predict_task(client, cache, GEMMA_HEAVY, meta, inp)
+                lat_sum += uH.get("latency_s",0.0); tok_sum += int(uH.get("total_tokens_est",0) or 0)
+                heavy_calls += 1
+                final_pred = pred
+                final_conf = max(base_conf, 0.80)  # escalate conf when heavy used
+            else:
+                final_pred = lite_pred
+                final_conf = base_conf
         else:
             # 일반적인 라우팅
             called_heavy = base_conf < THETA
@@ -1262,7 +1908,7 @@ def run_on_dataset(arm: str,
             sf.add_online(inp, teacher)
 
         # Step 5: Correctness
-        correct = int(normalize_text(final_pred) == normalize_text(gold))
+        correct = int(normalize_text(str(final_pred)) == normalize_text(str(gold)))
         corrects.append(correct); confs.append(final_conf)
         lat_sum += uL.get("latency_s",0.0); tok_sum += int(uL.get("total_tokens_est",0) or 0)
         decisions.append(bool(called_heavy))
@@ -1273,13 +1919,13 @@ def run_on_dataset(arm: str,
             # heavy가 실제로 더 잘했을 때만 need=True로 정의
             if called_heavy:
                 hv_pred = final_pred  # 이미 heavy 호출 결과
-                need = (normalize_text(lite_pred) != normalize_text(gold)) and \
-                       (normalize_text(hv_pred) == normalize_text(gold))
+                need = (normalize_text(str(lite_pred)) != normalize_text(str(gold))) and \
+                       (normalize_text(str(hv_pred)) == normalize_text(str(gold)))
             else:
                 # do NOT count this in cost/latency stats
                 hv_pred, _, _, _ = predict_task(client, cache, GEMMA_HEAVY, meta, inp)
-                need = (normalize_text(lite_pred) != normalize_text(gold)) and \
-                       (normalize_text(hv_pred) == normalize_text(gold))
+                need = (normalize_text(str(lite_pred)) != normalize_text(str(gold))) and \
+                       (normalize_text(str(hv_pred)) == normalize_text(str(gold)))
         else:
             # fallback heuristic: need heavy iff base_conf < THETA
             need = base_conf < THETA
@@ -1314,7 +1960,8 @@ def run_on_dataset(arm: str,
             if sf is not None and sf.model is not None:
                 print(f"   SetFit: {setfit_decision} (conf {setfit_conf:.2f}, unc {setfit_uncertainty:.2f})")
             if cbc_result is not None:
-                print(f"   CBC: evidence_score {cbc_result['evidence_score']:.2f}, final_conf {cbc_result['final_confidence']:.2f}")
+                print(f"   CBC: score {cbc_result['score']:.2f}, pass {cbc_result['pass']}")
+                print(f"   CBC parts: anchor={cbc_result['parts']['anchor']:.2f}, proto={cbc_result['parts']['proto']:.2f}, nli={cbc_result['parts']['nli']:.2f}")
             print(f"   Base: {base_conf:.2f} [{conf_mode}]")
             if conf_mode == "setfit_filter":
                 print(f"   Decision: SetFit 처리")
@@ -1326,7 +1973,20 @@ def run_on_dataset(arm: str,
 
     # Summaries
     n = min(len(X), MAX_QUERIES)
-    qual = {"accuracy": sum(corrects)/max(1,n)}
+    
+    # STSB 회귀 평가 적용
+    if meta["task"] == "reg":
+        # 회귀 태스크: 상관계수 계산
+        try:
+            pred_scores = [float(s.get("final_pred", s.get("lite_pred", "2.5"))) for s in samples_log]
+            gold_scores = [float(s.get("expected", "2.5")) for s in samples_log]
+            qual = pearson_spearman(pred_scores, gold_scores)
+        except:
+            # 파싱 실패 시 기본값
+            qual = {"pearson": 0.0, "spearman": 0.0}
+    else:
+        # 분류 태스크: 정확도 계산
+        qual = {"accuracy": sum(corrects)/max(1,n)}
     eff = {
         "avg_latency_s": lat_sum / max(1, n),
         "avg_tokens": tok_sum / max(1, n),
@@ -1339,12 +1999,18 @@ def run_on_dataset(arm: str,
     # Intent analytics (only for classification with labels)
     intent_stats = intent_coverage_diversity(samples_log, labels_all) if is_cls and labels_all else {}
     
-    # Search metrics (only for search tasks)
+    # Search/Ranking metrics
     search_stats = {}
     if is_search:
         predictions = [s.get("final_pred", s.get("lite_pred", "unknown")) for s in samples_log]
         gold_labels = [s.get("expected", "unknown") for s in samples_log]
         search_stats = search_metrics(predictions, gold_labels)
+    elif is_rank:
+        # 랭킹 메트릭 계산
+        predictions = [s.get("final_pred", s.get("lite_pred", "0")) for s in samples_log]
+        # meta에서 gold_indices 가져오기
+        gold_indices = meta.get("gold_indices", [0] * len(samples_log))
+        search_stats = ranking_metrics(predictions, gold_indices, k=10)
     # Cost savings
     savings = cost_savings_vs_heavy(eff["heavy_call_rate"])
 
@@ -1365,7 +2031,10 @@ def run_on_dataset(arm: str,
     print(f"\n{'='*80}")
     print(f"📊 {name.upper()} DATASET - {arm.upper()} ARCHITECTURE")
     print(f"{'='*80}")
-    print(f"\n🔍 QUALITY:    Acc {qual['accuracy']:.4f}")
+    if meta["task"] == "reg":
+        print(f"\n🔍 QUALITY:    Pearson {qual['pearson']:.4f} | Spearman {qual['spearman']:.4f}")
+    else:
+        print(f"\n🔍 QUALITY:    Acc {qual['accuracy']:.4f}")
     print(f"⚡ EFFICIENCY:  Lat {eff['avg_latency_s']:.3f}s | Tokens {eff['avg_tokens']:.1f} | Heavy {eff['heavy_call_rate']:.1%}")
     print(f"🎯 ROUTING:     Acc {route['routing_accuracy']:.3f} | FP {route['fp_rate']:.3f} | FN {route['fn_rate']:.3f} (θ={THETA})")
     print(f"🎛️ CALIBRATION: ECE {ece:.3f}")
@@ -1438,7 +2107,13 @@ def run_lllmI():
         # Simple comprehensive comparison (vs heavy)
         def combined_score(arm, heavy):
             # similar to earlier: perf 40%, cost 30%, latency 30%
-            perf_ratio = arm["quality"]["accuracy"] / max(1e-9, heavy["quality"]["accuracy"])
+            if meta["task"] == "reg":
+                # 회귀 태스크: Pearson 상관계수 사용
+                perf_ratio = arm["quality"]["pearson"] / max(1e-9, heavy["quality"]["pearson"])
+            else:
+                # 분류 태스크: 정확도 사용
+                perf_ratio = arm["quality"]["accuracy"] / max(1e-9, heavy["quality"]["accuracy"])
+            
             lat_impr = (heavy["efficiency"]["avg_latency_s"] - arm["efficiency"]["avg_latency_s"]) / max(1e-9, heavy["efficiency"]["avg_latency_s"])
             savings = 1.0 - arm["efficiency"]["heavy_call_rate"]
             return 0.4*perf_ratio + 0.3*savings + 0.3*(1.0 + lat_impr)
@@ -1447,8 +2122,15 @@ def run_lllmI():
         for arm_name, arm_metrics in [("A_heavy_only", A), ("B_lite_then_route", B), ("C_setfit", C), ("D_cbc_enhanced", D)]:
             if not arm_metrics: continue
             score = "Baseline" if arm_name=="A_heavy_only" else f"{combined_score(arm_metrics, A):.3f}"
+            
+            # 품질 지표 출력 형식 결정
+            if meta["task"] == "reg":
+                quality_str = f"Pearson {arm_metrics['quality']['pearson']:.3f}"
+            else:
+                quality_str = f"Acc {arm_metrics['quality']['accuracy']:.4f}"
+            
             table.append((arm_name,
-                          f"Acc {arm_metrics['quality']['accuracy']:.4f}",
+                          quality_str,
                           f"{arm_metrics['efficiency']['avg_latency_s']:.3f}",
                           f"{arm_metrics['efficiency']['heavy_call_rate']:.1%}",
                           f"ECE {arm_metrics['calibration']['ECE']:.3f}",

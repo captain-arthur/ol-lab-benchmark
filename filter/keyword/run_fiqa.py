@@ -43,20 +43,20 @@ def get_fiqa_config() -> KeywordFilterConfig:
         idf_min=float(os.getenv("OL_IDF_MIN", "0.1")),         # FiQA 기본값
         max_expanded=int(os.getenv("OL_MAX_EXPANDED", "8")),
         
-        # 후보 기반 설정 (FiQA 스타일)
-        top_r_pure=200,
-        alpha_soft_bonus=float(os.getenv("OL_ALPHA", "0.5")),
-        anchor_k=int(os.getenv("OL_ANCHOR_K", "3")),
-        rrf_k=float(os.getenv("OL_RRF_K", "60.0")),
+        # 후보 기반 설정 (FiQA 스타일) - Recall 중심 튜닝
+        top_r_pure=300,  # 200->300: 더 많은 후보 유지
+        alpha_soft_bonus=float(os.getenv("OL_ALPHA", "0.3")),  # 0.5->0.3: 보수적 보너스
+        anchor_k=int(os.getenv("OL_ANCHOR_K", "5")),  # 3->5: 더 많은 앵커 보호
+        rrf_k=float(os.getenv("OL_RRF_K", "40.0")),  # 60->40: RRF 가중치 증가
         
-        # 전체 문서 설정 (MS MARCO 스타일)
-        top_r_sem=int(os.getenv("OL_TOP_R_SEM", "1000")),
-        expanded_weight=0.35,
-        alpha_bonus=0.45,
-        enable_safe_drop=False,  # FiQA에서는 SAFE-DROP 비활성화
+        # 전체 문서 설정 (MS MARCO 스타일) - Recall 중심 튜닝
+        top_r_sem=int(os.getenv("OL_TOP_R_SEM", "3000")),  # 1000->3000: 더 많은 후보 유지
+        expanded_weight=0.25,  # 0.35->0.25: 보수적 확장
+        alpha_bonus=0.3,  # 0.45->0.3: 보수적 보너스
+        # SAFE-DROP 완전 제거됨 - FN 최소화를 위해
         
-        # 공통 안전장치
-        guardrail_k=int(os.getenv("OL_GUARDRAIL_K", "100")),
+        # 공통 안전장치 (Recall 중심 튜닝)
+        guardrail_k=int(os.getenv("OL_GUARDRAIL_K", "200")),  # 100->200: 더 많은 관련 문서 보호
         enable_prf_fallback=True,
         
         # BM25 파라미터

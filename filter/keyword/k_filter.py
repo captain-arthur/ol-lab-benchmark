@@ -31,21 +31,20 @@ class KeywordFilterConfig:
         self.adaptive_mode = kwargs.get("adaptive_mode", True)
         self.candidate_threshold = kwargs.get("candidate_threshold", 1000)
         
-        # 후보 기반 설정 (FiQA 스타일)
-        self.top_r_pure = kwargs.get("top_r_pure", 200)
-        self.alpha_soft_bonus = kwargs.get("alpha_soft_bonus", 0.5)
-        self.anchor_k = kwargs.get("anchor_k", 3)
-        self.rrf_k = kwargs.get("rrf_k", 60.0)
+        # 후보 기반 설정 (FiQA 스타일) - Recall 중심 튜닝
+        self.top_r_pure = kwargs.get("top_r_pure", 300)  # 200->300: 더 많은 후보 유지
+        self.alpha_soft_bonus = kwargs.get("alpha_soft_bonus", 0.3)  # 0.5->0.3: 보수적 보너스
+        self.anchor_k = kwargs.get("anchor_k", 5)  # 3->5: 더 많은 앵커 보호
+        self.rrf_k = kwargs.get("rrf_k", 40.0)  # 60->40: RRF 가중치 증가
         
-        # 전체 문서 설정 (MS MARCO 스타일)
-        self.top_r_sem = kwargs.get("top_r_sem", 2000)
-        self.expanded_weight = kwargs.get("expanded_weight", 0.35)
-        self.alpha_bonus = kwargs.get("alpha_bonus", 0.45)
-        self.enable_safe_drop = kwargs.get("enable_safe_drop", True)
-        self.safe_drop_quantile = kwargs.get("safe_drop_quantile", 0.25)
+        # 전체 문서 설정 (MS MARCO 스타일) - Recall 중심 튜닝
+        self.top_r_sem = kwargs.get("top_r_sem", 3000)  # 2000->3000: 더 많은 후보 유지
+        self.expanded_weight = kwargs.get("expanded_weight", 0.25)  # 0.35->0.25: 보수적 확장
+        self.alpha_bonus = kwargs.get("alpha_bonus", 0.3)  # 0.45->0.3: 보수적 보너스
+        # SAFE-DROP 제거됨 - FN 최소화를 위해
         
-        # 공통 안전장치
-        self.guardrail_k = kwargs.get("guardrail_k", 100)
+        # 공통 안전장치 (Recall 중심 튜닝)
+        self.guardrail_k = kwargs.get("guardrail_k", 200)  # 100->200: 더 많은 관련 문서 보호
         self.enable_prf_fallback = kwargs.get("enable_prf_fallback", True)
         
         # BM25 파라미터
@@ -405,35 +404,7 @@ def full_document_rerank(query: str, documents: List[str], base_scores: np.ndarr
     
     top_candidates = dedup(cand_mixed + cand_pure)
     
-    # SAFE-DROP (선택적)
-    safe_dropped = 0
-    if config.enable_safe_drop and expanded:
-        expanded_token_set = set()
-        for phrase in expanded:
-            expanded_token_set.update(tokenize_en(phrase))
-        
-        if expanded_token_set:
-            q25 = float(np.quantile(pure_scores, config.safe_drop_quantile)) if len(pure_scores) > 0 else -1e9
-            query_token_set = set(q_tokens)
-            
-            def has_overlap(doc_tokens: Set[str], probe: Set[str]) -> bool:
-                return len(doc_tokens & probe) > 0
-            
-            kept_after_safe = []
-            for doc_id in top_candidates:
-                if doc_id in cand_pure:
-                    kept_after_safe.append(doc_id)
-                    continue
-                doc_tokens, _ = doc_index[doc_id]
-                cond_low_bm25 = pure_scores[doc_id] < q25
-                cond_no_query = not has_overlap(doc_tokens, query_token_set)
-                cond_no_expand = not (expanded_token_set and has_overlap(doc_tokens, expanded_token_set))
-                if cond_low_bm25 and cond_no_query and cond_no_expand:
-                    safe_dropped += 1
-                else:
-                    kept_after_safe.append(doc_id)
-            
-            top_candidates = kept_after_safe
+    # SAFE-DROP 제거됨 - FN 최소화를 위해 모든 후보 유지
     
     # 재랭킹
     reranked_candidates: List[Tuple[int, float]] = []
@@ -465,8 +436,6 @@ def full_document_rerank(query: str, documents: List[str], base_scores: np.ndarr
         "semantic_applied": bool(expanded),
         "filtered_terms": {"expanded": expanded},
         "skipped_by_dfidf": not bool(expanded),
-        "safe_drop_quantile": config.safe_drop_quantile,
-        "safe_dropped": safe_dropped,
         "mode": "full_document"
     }
     

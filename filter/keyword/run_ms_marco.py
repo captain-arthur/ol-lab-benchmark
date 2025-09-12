@@ -41,21 +41,20 @@ def get_ms_marco_config() -> KeywordFilterConfig:
         idf_min=0.05,    # MS MARCO 기본값
         max_expanded=8,
         
-        # 후보 기반 설정 (FiQA 스타일)
-        top_r_pure=200,
-        alpha_soft_bonus=0.5,
-        anchor_k=3,
-        rrf_k=60.0,
+        # 후보 기반 설정 (FiQA 스타일) - Recall 중심 튜닝
+        top_r_pure=300,  # 200->300: 더 많은 후보 유지
+        alpha_soft_bonus=0.3,  # 0.5->0.3: 보수적 보너스
+        anchor_k=5,  # 3->5: 더 많은 앵커 보호
+        rrf_k=40.0,  # 60->40: RRF 가중치 증가
         
-        # 전체 문서 설정 (MS MARCO 스타일)
-        top_r_sem=int(os.getenv("OL_TOP_R_SEM", "2000")),  # 1000 -> 2000(기본), 필요시 4000
-        expanded_weight=float(os.getenv("OL_EXP_W", "0.35")),  # 0.25~0.45 튠 권장
-        alpha_bonus=0.45,
-        enable_safe_drop=True,  # MS MARCO에서는 SAFE-DROP 활성화
-        safe_drop_quantile=float(os.getenv("OL_SAFE_DROP_Q", "0.25")),  # q25
+        # 전체 문서 설정 (MS MARCO 스타일) - Recall 중심 튜닝
+        top_r_sem=int(os.getenv("OL_TOP_R_SEM", "3000")),  # 2000->3000: 더 많은 후보 유지
+        expanded_weight=float(os.getenv("OL_EXP_W", "0.25")),  # 0.35->0.25: 보수적 확장
+        alpha_bonus=0.3,  # 0.45->0.3: 보수적 보너스
+        # SAFE-DROP 완전 제거됨 - FN 최소화를 위해
         
-        # 공통 안전장치
-        guardrail_k=100,
+        # 공통 안전장치 (Recall 중심 튜닝)
+        guardrail_k=200,  # 100->200: 더 많은 관련 문서 보호
         enable_prf_fallback=True,
         
         # BM25 파라미터
@@ -226,10 +225,7 @@ def run_benchmark(semantic: bool,
                 "query": query,
                 "expanded": {"keywords": filtered.get("expanded", [])},
                 "recall_guardrail_applied": debug_info.get("recall_guardrail_applied", False),
-                "pure_missing_cnt": debug_info.get("pure_missing_cnt", 0),
-                "safe_drop_q": debug_info.get("safe_drop_q", None),
-                "safe_drop_q25": debug_info.get("safe_drop_q25", None),
-                "safe_dropped": debug_info.get("safe_dropped", 0)
+                "pure_missing_cnt": debug_info.get("pure_missing_cnt", 0)
             }
             with open(semantic_data_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -244,14 +240,14 @@ def run_benchmark(semantic: bool,
             sem_used = 'Y' if debug_info.get("semantic_applied", False) else ('-' if not sem_data else 'N')
             print(f"[{mode}] Q{q_idx} query='{query[:60]}' sem_used={sem_used} "
                   f"top_r={config.top_r_sem if semantic else config.top_r_pure} "
-                  f"w_exp={config.expanded_weight} safe_dropped={debug_info.get('safe_dropped',0)}")
+                  f"w_exp={config.expanded_weight}")
 
     elapsed = time.time() - t0
     result_metrics = metrics.result()
 
     # 메타 저장
     meta = {
-        "model": "BM25 (+semantic rerank, safe-drop, recall-guardrail, PRF-fallback)" if semantic else "BM25 (pure)",
+        "model": "BM25 (+semantic rerank, recall-guardrail, PRF-fallback)" if semantic else "BM25 (pure)",
         "bm25_params": {"k1": config.k1, "b": config.b},
         "data": {
             "split": split,
@@ -268,8 +264,7 @@ def run_benchmark(semantic: bool,
             "DF_THRESH": config.df_thresh,
             "IDF_MIN": config.idf_min,
             "MAX_EXPANDED": config.max_expanded,
-            "EXPANDED_WEIGHT": config.expanded_weight,
-            "SAFE_DROP_QUANTILE": config.safe_drop_quantile
+            "EXPANDED_WEIGHT": config.expanded_weight
         }
     }
     
@@ -359,7 +354,7 @@ def run_ms_marco():
             out_dir=EXPERIMENT_CONFIG["out_dir"]
         )
 
-        print("\nRunning Semantic BM25 (Recall-first + SAFE-DROP + guardrail + PRF fallback)...")
+        print("\nRunning Semantic BM25 (Recall-first + guardrail + PRF fallback)...")
         semantic_metrics = run_benchmark(
             semantic=True,
             split=EXPERIMENT_CONFIG["split"],

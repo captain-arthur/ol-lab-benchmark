@@ -33,9 +33,9 @@ class KeywordFilterConfig:
         
         # 후보 기반 설정 (FiQA 스타일) - Recall 중심 튜닝
         self.top_r_pure = kwargs.get("top_r_pure", 300)  # 200->300: 더 많은 후보 유지
-        self.alpha_soft_bonus = kwargs.get("alpha_soft_bonus", 0.3)  # 0.5->0.3: 보수적 보너스
+        self.alpha_soft_bonus = kwargs.get("alpha_soft_bonus", 1.0)  # Recall 우선 강화
         self.anchor_k = kwargs.get("anchor_k", 5)  # 3->5: 더 많은 앵커 보호
-        self.rrf_k = kwargs.get("rrf_k", 40.0)  # 60->40: RRF 가중치 증가
+        self.rrf_k = kwargs.get("rrf_k", 20.0)  # 확장어 효과를 더 강하게 반영
         
         # 전체 문서 설정 (MS MARCO 스타일) - Recall 중심 튜닝
         self.top_r_sem = kwargs.get("top_r_sem", 3000)  # 2000->3000: 더 많은 후보 유지
@@ -137,6 +137,29 @@ def map_at_k(ranked_rel: List[int], k: int = 100) -> float:
 # -----------------------------
 # Index/Statistics
 # -----------------------------
+
+# 억제 단어(전역)
+DENYLIST = {
+    "a","an","the","and","or","of","to","in","on","for","with","from","by","as","at",
+    "is","are","was","were","be","been","being","have","has","had","do","does","did",
+    "can","could","should","would","may","might","will","your","you","this","that",
+    "these","those","which","not","no","yes","it","its","we","they","i"
+}
+
+def build_global_stats(passages: List[str], tokenizer=tokenize_en):
+    """코퍼스 전역 DF/IDF 준비 함수"""
+    df_global = build_df_dict(passages, tokenizer)
+    N_global = len(passages)
+    idf_global = build_idf_dict_from_df(df_global, N_global)
+    return df_global, idf_global, N_global
+
+def quantile_threshold(values: List[float], q: float, default: float) -> float:
+    """분위수 기반 임계값 계산"""
+    if not values: 
+        return default
+    arr = np.array(values, dtype=float)
+    return float(np.quantile(arr, q))
+
 def build_idf_dict_from_df(df_dict: Dict[str, int], N: int) -> Dict[str, float]:
     """DF 딕셔너리로부터 IDF 딕셔너리 생성"""
     idf_dict: Dict[str, float] = {}
@@ -173,7 +196,7 @@ def build_semantic_data_ollama(query: str,
                                retries: int = 2) -> Optional[Dict[str, Any]]:
     """LLM을 통한 시맨틱 확장 데이터 생성"""
     prompt = f"""
-Return ONLY a valid JSON object (no code fences). You expand the user query for information retrieval.
+You are a query expansion assistant for information retrieval. Return ONLY a valid JSON object without any code fences, markdown, or additional text.
 
 Schema:
 {{
@@ -188,9 +211,9 @@ Rules:
 - Each phrase <=4 words, distinct, lowercase.
 - No filler words (e.g., "and", "from"), no duplicates.
 - No additional fields or commentary.
+- Return ONLY the JSON object, nothing else.
 
-Now output JSON for:
-"{query}"
+Query: "{query}"
 """.strip()
 
     for attempt in range(retries + 1):
@@ -229,9 +252,32 @@ Now output JSON for:
 # -----------------------------
 # Query Expansion Utils
 # -----------------------------
+def filter_semantic_terms_tokens(
+    phrases: List[str],
+    df_global: Dict[str,int],
+    idf_global: Dict[str,float],
+    N_global: int,
+    **kwargs
+) -> List[str]:
+    """확장어 필터: 무조건 최소 1개 이상 확장어를 사용 (Recall 보장 모드)"""
+    tokens = []
+    for ph in phrases or []:
+        for t in tokenize_en(ph):
+            if len(t) >= 3 and t not in DENYLIST:
+                tokens.append(t)
+    tokens = dedup(tokens)
+
+    kept = tokens[:]  # 대부분 유지
+
+    # 최소 1개는 무조건 사용
+    if not kept and tokens:
+        kept = tokens[:1]
+
+    return kept
+
 def filter_semantic_terms(terms: List[str], df_dict: Dict[str, int], N: int, 
                          idf: Dict[str, float], config: KeywordFilterConfig) -> List[str]:
-    """확장 키워드 필터링"""
+    """기존 호환성을 위한 래퍼 함수"""
     kept = []
     for t in normalize_terms(terms):
         if (df_dict.get(t, 0) / max(1, N)) <= config.df_thresh and idf.get(t, 0.0) >= config.idf_min:
@@ -251,9 +297,25 @@ def extract_expanded(sem_data: Optional[Dict[str, Any]],
         ek = sem_data.get("expanded_keywords", [])  # legacy fallback
     return filter_semantic_terms(ek, df_dict, N, idf, config)
 
+def soft_semantic_bonus_tokens_capped(
+    doc_tokens: Set[str],
+    idf_global: Dict[str,float],
+    expanded_tokens: List[str],
+    per_token_cap: float = 0.6,   # 토큰당 최대 기여
+    per_doc_cap: float = 1.5      # 문서당 총 보너스 상한
+) -> float:
+    """보너스 계산: 토큰 기반 + 문서당 상한(cap)"""
+    bonus = 0.0
+    for t in expanded_tokens:
+        if t in doc_tokens:
+            bonus += min(per_token_cap, idf_global.get(t, 0.0))
+            if bonus >= per_doc_cap:
+                return per_doc_cap
+    return bonus
+
 def soft_semantic_bonus_tokens(doc_tokens: Set[str], idf: Dict[str, float], 
                               expanded_terms: List[str], config: KeywordFilterConfig) -> float:
-    """확장 키워드 소프트 보너스 계산"""
+    """기존 호환성을 위한 래퍼 함수"""
     s = 0.0
     exp_tokens = set()
     for phrase in expanded_terms:
@@ -287,7 +349,8 @@ def prf_rm3_terms(passages: List[str], base_scores, tokenizer=tokenize_en,
 # Core Reranking Functions
 # -----------------------------
 def candidate_based_rerank(query: str, documents: List[str], base_scores: np.ndarray,
-                          semantic_data: Optional[Dict[str, Any]], config: KeywordFilterConfig) -> Tuple[List[int], List[float], Dict[str, Any]]:
+                          semantic_data: Optional[Dict[str, Any]], config: KeywordFilterConfig,
+                          df_global: Dict[str,int] = None, idf_global: Dict[str,float] = None, N_global: int = None) -> Tuple[List[int], List[float], Dict[str, Any]]:
     """후보 기반 재랭킹 (FiQA 스타일)"""
     N = len(documents)
     
@@ -296,27 +359,58 @@ def candidate_based_rerank(query: str, documents: List[str], base_scores: np.nda
     cand_idx.sort(key=lambda i: base_scores[i], reverse=True)
     cand_idx = cand_idx[:min(config.top_r_pure, N)]
     
-    # 후보 기반 DF/IDF
+    # 후보 토큰 인덱스
     cand_texts = [documents[i] for i in cand_idx]
-    df_dict = build_df_dict(cand_texts, tokenize_en)
-    idf = build_idf_dict_from_df(df_dict, len(cand_texts))
     doc_index = build_doc_token_index(cand_texts, tokenize_en)
+    top_docs_tokens = [doc_index[i][0] for i in range(min(len(cand_idx), config.anchor_k*4))]  # ex) 상위 20
+
+    # 전역 통계 사용 여부 확인
+    if df_global is not None and idf_global is not None and N_global is not None:
+        # 확장어 추출 (직접 추출, 필터링 없음)
+        expanded_phrases = []
+        if semantic_data and isinstance(semantic_data.get("expanded"), dict):
+            expanded_phrases = semantic_data["expanded"].get("keywords", [])
+        if not expanded_phrases:
+            expanded_phrases = semantic_data.get("expanded_keywords", []) if semantic_data else []
+        # 전역통계로 토큰 정제 (Recall 보장 모드)
+        print(f"    DEBUG: expanded_phrases = {expanded_phrases}")
+        expanded_tokens = filter_semantic_terms_tokens(
+            expanded_phrases, df_global, idf_global, N_global
+        )
+        print(f"    DEBUG: expanded_tokens = {expanded_tokens}")
+
+        # PRF fallback (확장 토큰이 너무 적을 때만)
+        if not expanded_tokens and config.enable_prf_fallback:
+            prf_terms = prf_rm3_terms(cand_texts, np.array([base_scores[i] for i in cand_idx]))
+            expanded_tokens = filter_semantic_terms_tokens(
+                prf_terms, df_global, idf_global, N_global
+            )
+    else:
+        # 기존 방식 (호환성)
+        df_dict = build_df_dict(cand_texts, tokenize_en)
+        idf = build_idf_dict_from_df(df_dict, len(cand_texts))
+        expanded = extract_expanded(semantic_data, df_dict, len(cand_texts), idf, config)
+        
+        # PRF fallback
+        if not expanded and config.enable_prf_fallback:
+            prf_terms = prf_rm3_terms(cand_texts, np.array([base_scores[i] for i in cand_idx]))
+            expanded = filter_semantic_terms(prf_terms, df_dict, len(cand_texts), idf, config)
+        expanded_tokens = expanded
     
-    # 확장 키워드 추출
-    expanded = extract_expanded(semantic_data, df_dict, len(cand_texts), idf, config)
-    
-    # PRF fallback
-    if not expanded and config.enable_prf_fallback:
-        prf_terms = prf_rm3_terms(cand_texts, np.array([base_scores[i] for i in cand_idx]))
-        expanded = filter_semantic_terms(prf_terms, df_dict, len(cand_texts), idf, config)
-    
-    # 소프트 보너스 재랭킹
+    # 소프트 보너스 재랭킹 (전역 IDF, 보너스 capped)
     pairs: List[Tuple[int, float]] = []
     for loc, (_tokset, _passage) in doc_index.items():
         s = float(base_scores[cand_idx[loc]])
-        for t in expanded:
-            if t in _tokset:
-                s += config.alpha_soft_bonus * idf.get(t, 0.0)
+        if expanded_tokens and df_global is not None and idf_global is not None:
+            s += config.alpha_soft_bonus * soft_semantic_bonus_tokens_capped(
+                _tokset, idf_global, expanded_tokens,
+                per_token_cap=0.6, per_doc_cap=1.5
+            )
+        elif expanded_tokens:
+            # 기존 방식 (호환성)
+            for t in expanded_tokens:
+                if t in _tokset:
+                    s += config.alpha_soft_bonus * idf.get(t, 0.0)
         pairs.append((loc, s))
     
     # 정렬
@@ -349,10 +443,10 @@ def candidate_based_rerank(query: str, documents: List[str], base_scores: np.nda
     final_scores = [float(base_scores[i]) for i in final_global_order]
     
     debug_info = {
-        "semantic_applied": bool(expanded),
-        "filtered_terms": {"expanded": expanded},
-        "skipped_by_dfidf": not bool(expanded),
-        "mode": "candidate_based"
+        "semantic_applied": bool(expanded_tokens),
+        "filtered_terms": {"expanded_tokens": expanded_tokens},
+        "skipped_by_dfidf": not bool(expanded_tokens),
+        "mode": "candidate_based_global_stats" if df_global is not None else "candidate_based"
     }
     
     return final_global_order, final_scores, debug_info
@@ -377,8 +471,20 @@ def full_document_rerank(query: str, documents: List[str], base_scores: np.ndarr
     pure_scores = bm25.get_scores(q_tokens)
     base_scores = list(pure_scores)
     
-    # 확장 키워드 추출
-    expanded = extract_expanded(semantic_data, df_dict, N, idf, config)
+    # 확장 키워드 추출 (직접 추출, 필터링 없음)
+    expanded_phrases = []
+    if semantic_data and isinstance(semantic_data.get("expanded"), dict):
+        expanded_phrases = semantic_data["expanded"].get("keywords", [])
+    if not expanded_phrases:
+        expanded_phrases = semantic_data.get("expanded_keywords", []) if semantic_data else []
+    
+    # 토큰화 및 필터링
+    expanded = []
+    for phrase in expanded_phrases:
+        for t in tokenize_en(phrase):
+            if len(t) >= 3 and t not in DENYLIST:
+                expanded.append(t)
+    expanded = dedup(expanded)
     
     # PRF fallback
     if not expanded and config.enable_prf_fallback:
@@ -434,7 +540,7 @@ def full_document_rerank(query: str, documents: List[str], base_scores: np.ndarr
     
     debug_info = {
         "semantic_applied": bool(expanded),
-        "filtered_terms": {"expanded": expanded},
+        "filtered_terms": {"expanded_tokens": expanded},
         "skipped_by_dfidf": not bool(expanded),
         "mode": "full_document"
     }
@@ -446,12 +552,13 @@ def full_document_rerank(query: str, documents: List[str], base_scores: np.ndarr
 # Main Reranking Function
 # -----------------------------
 def semantic_rerank(query: str, documents: List[str], base_scores: np.ndarray,
-                   semantic_data: Optional[Dict[str, Any]], config: KeywordFilterConfig) -> Tuple[List[int], List[float], Dict[str, Any]]:
+                   semantic_data: Optional[Dict[str, Any]], config: KeywordFilterConfig,
+                   df_global: Dict[str,int] = None, idf_global: Dict[str,float] = None, N_global: int = None) -> Tuple[List[int], List[float], Dict[str, Any]]:
     """통합 시맨틱 재랭킹 함수"""
     
     # 적응형 방식 선택
     if config.adaptive_mode and len(documents) <= config.candidate_threshold:
-        return candidate_based_rerank(query, documents, base_scores, semantic_data, config)
+        return candidate_based_rerank(query, documents, base_scores, semantic_data, config, df_global, idf_global, N_global)
     else:
         return full_document_rerank(query, documents, base_scores, semantic_data, config)
 

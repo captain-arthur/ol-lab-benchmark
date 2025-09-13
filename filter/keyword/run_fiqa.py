@@ -11,7 +11,8 @@ from rank_bm25 import BM25Okapi
 # 공통 모듈 import
 from k_filter import (
     KeywordFilterConfig, ensure_dir, _key, tokenize_en, 
-    build_semantic_data_ollama, semantic_rerank, MetricsAccumulator
+    build_semantic_data_ollama, semantic_rerank, MetricsAccumulator,
+    build_global_stats
 )
 
 
@@ -135,11 +136,27 @@ def run_benchmark(semantic: bool = False,
     tokenized_docs = [tokenize_en(doc) for doc in documents]
     bm25 = BM25Okapi(tokenized_docs, k1=1.5, b=0.75)
 
+    # 전역 통계 계산 (개선된 필터링을 위해, 샘플링으로 성능 최적화)
+    print("Building global statistics...")
+    # 전체 문서의 20% 샘플링으로 통계 계산 (성능 최적화)
+    sample_size = min(10000, len(documents) // 5)  # 최대 10,000개 또는 전체의 20%
+    if sample_size < len(documents):
+        import random
+        random.seed(42)  # 재현 가능한 샘플링
+        sampled_docs = random.sample(documents, sample_size)
+        print(f"Using {sample_size} sampled documents for global statistics")
+    else:
+        sampled_docs = documents
+        print(f"Using all {len(documents)} documents for global statistics")
+    
+    df_global, idf_global, N_global = build_global_stats(sampled_docs, tokenize_en)
+
     # 설정 로드
     config = get_fiqa_config()
 
-    # 캐시 초기화/프리로드
+    # 캐시 초기화/프리로드 (성능 최적화)
     cache: List[Dict[str, Any]] = []
+    cache_dict: Dict[str, Dict[str, Any]] = {}  # 빠른 조회를 위한 딕셔너리
     cache_path = None
     semantic_data_path = None
     mode = "semantic" if semantic else "pure"
@@ -154,12 +171,17 @@ def run_benchmark(semantic: bool = False,
         ensure_dir(cache_dir)
         cache_path = os.path.join(cache_dir, "ollama_cache.json")
 
-        # 기존 캐시 로드
+        # 기존 캐시 로드 (성능 최적화)
         if os.path.exists(cache_path):
             try:
                 loaded = json.load(open(cache_path, "r", encoding="utf-8"))
                 if isinstance(loaded, list):
                     cache = loaded
+                    # 빠른 조회를 위한 딕셔너리 구축
+                    for item in cache:
+                        k = _key(item.get("query", ""))
+                        cache_dict[k] = item
+                    print(f"Loaded {len(cache)} cached semantic expansions")
             except Exception:
                 cache = []
 
@@ -196,21 +218,36 @@ def run_benchmark(semantic: bool = False,
         rel_set = set(rel_list)
         if len(rel_set) == 0:
             continue
+        
+        # 진행상황 로깅
+        print(f"\n[{qi}/{n_queries}] Processing query: {qtext[:60]}{'...' if len(qtext) > 60 else ''}")
+        print(f"  Query ID: {qid}, Relevant docs: {len(rel_set)}")
 
         # BM25 base scores (전코퍼스 1회)
         q_tokens = tokenize_en(qtext)
         base_scores = bm25.get_scores(q_tokens)
 
-        # semantic 데이터 준비
+        # semantic 데이터 준비 (개선된 캐시 로직)
         sem_data = None
         if semantic and (np.random.rand() < config.semantic_sample_rate):
             metrics.add_sem_attempt()
             k = _key(qtext)
-            for item in cache:
-                if _key(item.get("query", "")) == k:
+            
+            # 캐시 조회 (O(1) 딕셔너리 조회)
+            if k in cache_dict:
+                item = cache_dict[k]
+                # 품질 검증: 확장 키워드가 충분한지 확인
+                expanded = item.get("expanded", {})
+                keywords = expanded.get("keywords", []) if isinstance(expanded, dict) else []
+                if len(keywords) >= 3:  # 최소 3개 이상의 확장 키워드 필요
                     sem_data = item
                     hits += 1
-                    break
+                    print(f"  ✓ Cache HIT: {len(keywords)} keywords")
+                else:
+                    print(f"  ⚠ Cache HIT but low quality: {len(keywords)} keywords")
+            else:
+                print(f"  ✗ Cache MISS: calling LLM...")
+            
             if sem_data is None:
                 misses += 1
                 sem_data = build_semantic_data_ollama(
@@ -220,18 +257,45 @@ def run_benchmark(semantic: bool = False,
                     timeout=config.ollama_timeout,
                     retries=config.ollama_retries
                 )
+                
+                # 품질 검증 후 캐시에 추가
                 if sem_data:
-                    cache.append(sem_data)
-                    if cache_path is not None:
-                        try:
-                            json.dump(cache, open(cache_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-                        except Exception:
-                            pass
+                    expanded = sem_data.get("expanded", {})
+                    keywords = expanded.get("keywords", []) if isinstance(expanded, dict) else []
+                    if len(keywords) >= 3:  # 품질이 좋은 경우만 캐시에 추가
+                        # 중복 체크 후 추가 (O(1) 딕셔너리 조회)
+                        k_new = _key(sem_data.get("query", ""))
+                        if k_new not in cache_dict:
+                            cache.append(sem_data)
+                            cache_dict[k_new] = sem_data
+                            print(f"  ✓ Added to cache: {len(keywords)} keywords")
+                            if cache_path is not None:
+                                try:
+                                    json.dump(cache, open(cache_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+                                except Exception:
+                                    pass
+                        else:
+                            print(f"  ⚠ Duplicate detected, not cached")
+                    else:
+                        print(f"  ⚠ Low quality LLM response: {len(keywords)} keywords, not cached")
+                else:
+                    print(f"  ✗ LLM call failed")
+        else:
+            print(f"  → Pure BM25 mode (no semantic expansion)")
 
-        # 공통 모듈을 사용한 재랭킹
+        # 공통 모듈을 사용한 재랭킹 (전역 통계 전달)
+        print(f"  → Reranking with {'semantic' if sem_data else 'pure'} BM25...")
         final_order, final_scores, debug = semantic_rerank(
-            qtext, documents, base_scores, sem_data, config
+            qtext, documents, base_scores, sem_data, config, df_global, idf_global, N_global
         )
+        
+        # 디버그 정보 출력
+        if debug.get("semantic_applied"):
+            filtered_terms = debug.get("filtered_terms", {})
+            expanded_tokens = filtered_terms.get("expanded_tokens", [])
+            print(f"  → Used {len(expanded_tokens)} filtered tokens: {expanded_tokens[:5]}{'...' if len(expanded_tokens) > 5 else ''}")
+        else:
+            print(f"  → No semantic expansion applied")
 
         # 순위별 관련성 계산
         ranked_rel_bin: List[int] = []
@@ -247,6 +311,16 @@ def run_benchmark(semantic: bool = False,
                 metrics.add_skipped_by_dfidf()
 
         total_pairs += min(len(final_order), 1000)
+        
+        # 쿼리별 결과 요약
+        rel_found = sum(ranked_rel_bin)
+        print(f"  → Found {rel_found}/{len(rel_set)} relevant docs")
+
+        # 진행상황 출력 (5개마다)
+        if qi % 5 == 0:
+            elapsed = time.time() - t0
+            cache_hit_rate = hits / (hits + misses) * 100 if (hits + misses) > 0 else 0
+            print(f"  📊 Progress: {qi}/{n_queries} queries, {elapsed:.1f}s elapsed, Cache: {cache_hit_rate:.1f}% hit rate")
 
         # semantic jsonl 저장
         if semantic and sem_data and semantic_data_path:

@@ -119,7 +119,8 @@ def load_fiqa_data(split: str = "test") -> Tuple[List[str], List[Dict[str, Any]]
 def run_benchmark(semantic: bool = False,
                   split: str = "test",
                   max_queries: int = 20,
-                  out_dir: str = "results") -> Dict[str, Any]:
+                  out_dir: str = "results",
+                  expansion_mode: str = "filtered") -> Dict[str, Any]:
 
     ensure_dir(out_dir)
     documents, queries, qrels_map = load_fiqa_data(split)
@@ -177,10 +178,21 @@ def run_benchmark(semantic: bool = False,
                 loaded = json.load(open(cache_path, "r", encoding="utf-8"))
                 if isinstance(loaded, list):
                     cache = loaded
-                    # 빠른 조회를 위한 딕셔너리 구축
+                    # 빠른 조회를 위한 딕셔너리 구축 (품질 우선순위)
                     for item in cache:
                         k = _key(item.get("query", ""))
-                        cache_dict[k] = item
+                        if k not in cache_dict:
+                            # 첫 번째 엔트리
+                            cache_dict[k] = item
+                        else:
+                            # 기존 엔트리와 품질 비교
+                            existing = cache_dict[k]
+                            existing_keywords = existing.get("expanded", {}).get("keywords", [])
+                            new_keywords = item.get("expanded", {}).get("keywords", [])
+                            
+                            # 더 많은 키워드를 가진 엔트리 우선
+                            if len(new_keywords) > len(existing_keywords):
+                                cache_dict[k] = item
                     print(f"Loaded {len(cache)} cached semantic expansions")
             except Exception:
                 cache = []
@@ -286,7 +298,7 @@ def run_benchmark(semantic: bool = False,
         # 공통 모듈을 사용한 재랭킹 (전역 통계 전달)
         print(f"  → Reranking with {'semantic' if sem_data else 'pure'} BM25...")
         final_order, final_scores, debug = semantic_rerank(
-            qtext, documents, base_scores, sem_data, config, df_global, idf_global, N_global
+            qtext, documents, base_scores, sem_data, config, df_global, idf_global, N_global, expansion_mode
         )
         
         # 디버그 정보 출력
@@ -401,67 +413,156 @@ def run_benchmark(semantic: bool = False,
     return meta
 
 
-def print_comparison_summary(pure_metrics: Dict[str, Any], semantic_metrics: Dict[str, Any]):
-    """순수 BM25 vs 시맨틱 BM25 비교 요약"""
-    print("\n" + "="*60)
-    print("PURE vs SEMANTIC COMPARISON SUMMARY")
-    print("="*60)
-    pure_scores = pure_metrics.get("metrics", pure_metrics)
-    sem_scores  = semantic_metrics.get("metrics", semantic_metrics)
-    def fmt(k):
-        a, b = pure_scores[k], sem_scores[k]
-        arrow = "↑" if b > a else "↓"
-        return f"{a:.3f} → {b:.3f} ({arrow}{abs(b-a):.3f})"
-    print(f"P@1     : {fmt('P@1')}")
-    print(f"P@10    : {fmt('P@10')}")
-    print(f"MRR@10  : {fmt('MRR@10')}")
-    print(f"nDCG@10 : {fmt('nDCG@10')}")
-    print(f"R@10    : {fmt('R@10')}")
-    if "semantic_debug" in semantic_metrics:
-        debug = semantic_metrics["semantic_debug"]
-        print(f"\nSemantic Rerank Stats: attempted={debug['sem_attempted']}, applied={debug['sem_applied']}, skipped_by_dfidf={debug['skipped_by_dfidf']}")
-    print("="*60)
-
-
 # -----------------------------
 # Runner
 # -----------------------------
-def run_fiqa():
-    """FiQA 벤치마크 실행"""
+def run_three_way_comparison(max_queries: int = 20):
+    """3-way 비교: 순수 BM25 vs 무조건적 확장 vs 정제된 확장"""
     print("=" * 60)
-    print("FiQA Financial Question Answering Benchmark")
+    print("FiQA 3-Way Comparison")
     print("=" * 60)
     print("Configuration:")
-    print(f"  - Max queries: {EXPERIMENT_CONFIG['max_queries']}")
+    print(f"  - Max queries: {max_queries}")
     print(f"  - Split: {EXPERIMENT_CONFIG['split']}")
     print(f"  - Output directory: {EXPERIMENT_CONFIG['out_dir']}")
     print()
 
     try:
-        print("Running Pure BM25...")
-        pure_metrics = run_benchmark(
+        results = {}
+        
+        # 1. Pure BM25 (baseline)
+        print("1. Running Pure BM25 (Baseline)...")
+        results["pure"] = run_benchmark(
             semantic=False,
             split=EXPERIMENT_CONFIG["split"],
-            max_queries=EXPERIMENT_CONFIG["max_queries"],
+            max_queries=max_queries,
             out_dir=EXPERIMENT_CONFIG["out_dir"]
         )
 
-        print("\nRunning Semantic BM25 (Rerank)...")
-        semantic_metrics = run_benchmark(
+        # 2. BM25 + 무조건적 키워드 확장
+        print("\n2. Running BM25 + 무조건적 키워드 확장...")
+        results["unfiltered"] = run_benchmark(
             semantic=True,
             split=EXPERIMENT_CONFIG["split"],
-            max_queries=EXPERIMENT_CONFIG["max_queries"],
-            out_dir=EXPERIMENT_CONFIG["out_dir"]
+            max_queries=max_queries,
+            out_dir=EXPERIMENT_CONFIG["out_dir"],
+            expansion_mode="unfiltered"
         )
 
-        print_comparison_summary(pure_metrics, semantic_metrics)
-        print("\nFiQA benchmark completed successfully!")
-        return True
+        # 3. BM25 + 의미 제약·정제된 확장 (제안 기법)
+        print("\n3. Running BM25 + 의미 제약·정제된 확장 (제안 기법)...")
+        results["filtered"] = run_benchmark(
+            semantic=True,
+            split=EXPERIMENT_CONFIG["split"],
+            max_queries=max_queries,
+            out_dir=EXPERIMENT_CONFIG["out_dir"],
+            expansion_mode="filtered"
+        )
+
+        # 4. 3-way Comparison
+        print("\n" + "=" * 60)
+        print("3-WAY COMPARISON SUMMARY")
+        print("=" * 60)
+        
+        pure_metrics = results["pure"]["metrics"]
+        unfiltered_metrics = results["unfiltered"]["metrics"]
+        filtered_metrics = results["filtered"]["metrics"]
+        
+        print(f"P@1     : {pure_metrics['P@1']:.3f} → {unfiltered_metrics['P@1']:.3f} → {filtered_metrics['P@1']:.3f}")
+        print(f"P@10    : {pure_metrics['P@10']:.3f} → {unfiltered_metrics['P@10']:.3f} → {filtered_metrics['P@10']:.3f}")
+        print(f"MRR@10  : {pure_metrics['MRR@10']:.3f} → {unfiltered_metrics['MRR@10']:.3f} → {filtered_metrics['MRR@10']:.3f}")
+        print(f"nDCG@10 : {pure_metrics['nDCG@10']:.3f} → {unfiltered_metrics['nDCG@10']:.3f} → {filtered_metrics['nDCG@10']:.3f}")
+        print(f"R@10    : {pure_metrics['R@10']:.3f} → {unfiltered_metrics['R@10']:.3f} → {filtered_metrics['R@10']:.3f}")
+        
+        print(f"\nImprovements over Pure BM25:")
+        print(f"  무조건적 확장: R@10 {unfiltered_metrics['R@10'] - pure_metrics['R@10']:+.3f}")
+        print(f"  정제된 확장:   R@10 {filtered_metrics['R@10'] - pure_metrics['R@10']:+.3f}")
+        print("=" * 60)
+        
+        # 3-way 비교 결과를 consolidated_results.json으로 저장
+        consolidated_results = {
+            "experiment_info": {
+                "dataset": "mteb/fiqa",
+                "split": "test",
+                "n_queries": max_queries,
+                "total_pairs": max_queries * 1000,  # 대략적 추정
+                "experiment_date": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "description": {
+                    "pure": "순수 BM25: 기본적인 정보 검색 모델",
+                    "simple": "단순 키워드 확장 BM25: 동의어 기반 확장, 정제 없음",
+                    "semantic": "의미적 확장 BM25: LLM 기반 확장, DF/IDF 정제, FN 최소화"
+                }
+            },
+            "core_metrics": {
+                "R@100": {
+                    "pure": pure_metrics['R@100'],
+                    "simple": unfiltered_metrics['R@100'],
+                    "semantic": filtered_metrics['R@100'],
+                    "improvement_pure_to_semantic": filtered_metrics['R@100'] - pure_metrics['R@100'],
+                    "improvement_simple_to_semantic": filtered_metrics['R@100'] - unfiltered_metrics['R@100']
+                },
+                "R@10": {
+                    "pure": pure_metrics['R@10'],
+                    "simple": unfiltered_metrics['R@10'],
+                    "semantic": filtered_metrics['R@10'],
+                    "improvement_pure_to_semantic": filtered_metrics['R@10'] - pure_metrics['R@10'],
+                    "improvement_simple_to_semantic": filtered_metrics['R@10'] - unfiltered_metrics['R@10']
+                }
+            },
+            "auxiliary_metrics": {
+                "P@10": {
+                    "pure": pure_metrics['P@10'],
+                    "simple": unfiltered_metrics['P@10'],
+                    "semantic": filtered_metrics['P@10']
+                },
+                "nDCG@10": {
+                    "pure": pure_metrics['nDCG@10'],
+                    "simple": unfiltered_metrics['nDCG@10'],
+                    "semantic": filtered_metrics['nDCG@10']
+                },
+                "MRR@10": {
+                    "pure": pure_metrics['MRR@10'],
+                    "simple": unfiltered_metrics['MRR@10'],
+                    "semantic": filtered_metrics['MRR@10']
+                }
+            },
+            "reference_metrics": {
+                "MAP@100": {
+                    "pure": pure_metrics['MAP@100'],
+                    "simple": unfiltered_metrics['MAP@100'],
+                    "semantic": filtered_metrics['MAP@100']
+                },
+                "nDCG@100": {
+                    "pure": pure_metrics['nDCG@100'],
+                    "simple": unfiltered_metrics['nDCG@100'],
+                    "semantic": filtered_metrics['nDCG@100']
+                }
+            },
+            "detailed_results": {
+                "pure": pure_metrics,
+                "simple": unfiltered_metrics,
+                "semantic": filtered_metrics
+            }
+        }
+        
+        # consolidated_results.json 저장
+        consolidated_path = os.path.join(EXPERIMENT_CONFIG["out_dir"], "consolidated_results.json")
+        ensure_dir(EXPERIMENT_CONFIG["out_dir"])
+        with open(consolidated_path, "w", encoding="utf-8") as f:
+            json.dump(consolidated_results, f, ensure_ascii=False, indent=2)
+        
+        print(f"\nConsolidated results saved to: {consolidated_path}")
+        
+        return results
 
     except Exception as e:
-        print(f"\n\nError during FiQA benchmark execution: {e}")
-        return False
+        print(f"\n\nError during 3-way comparison: {e}")
+        return None
 
 
 if __name__ == "__main__":
-    run_fiqa()
+    # 환경변수 기반 설정
+    max_queries = EXPERIMENT_CONFIG["max_queries"]
+    
+    # 항상 3-way 비교 실행
+    run_three_way_comparison(max_queries)

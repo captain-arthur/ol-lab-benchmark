@@ -275,6 +275,25 @@ def filter_semantic_terms_tokens(
 
     return kept
 
+
+def filter_semantic_terms_tokens_unfiltered(
+    phrases: List[str],
+    df_global: Dict[str,int],
+    idf_global: Dict[str,float],
+    N_global: int,
+    **kwargs
+) -> List[str]:
+    """확장어 필터: 정제 없이 무조건적 사용 (②번 방식)"""
+    tokens = []
+    for ph in phrases or []:
+        for t in tokenize_en(ph):
+            if len(t) >= 2:  # 최소 길이만 체크, DENYLIST 무시
+                tokens.append(t)
+    tokens = dedup(tokens)
+
+    # 정제 없이 그대로 사용
+    return tokens
+
 def filter_semantic_terms(terms: List[str], df_dict: Dict[str, int], N: int, 
                          idf: Dict[str, float], config: KeywordFilterConfig) -> List[str]:
     """기존 호환성을 위한 래퍼 함수"""
@@ -350,7 +369,8 @@ def prf_rm3_terms(passages: List[str], base_scores, tokenizer=tokenize_en,
 # -----------------------------
 def candidate_based_rerank(query: str, documents: List[str], base_scores: np.ndarray,
                           semantic_data: Optional[Dict[str, Any]], config: KeywordFilterConfig,
-                          df_global: Dict[str,int] = None, idf_global: Dict[str,float] = None, N_global: int = None) -> Tuple[List[int], List[float], Dict[str, Any]]:
+                          df_global: Dict[str,int] = None, idf_global: Dict[str,float] = None, N_global: int = None,
+                          expansion_mode: str = "filtered") -> Tuple[List[int], List[float], Dict[str, Any]]:
     """후보 기반 재랭킹 (FiQA 스타일)"""
     N = len(documents)
     
@@ -372,19 +392,29 @@ def candidate_based_rerank(query: str, documents: List[str], base_scores: np.nda
             expanded_phrases = semantic_data["expanded"].get("keywords", [])
         if not expanded_phrases:
             expanded_phrases = semantic_data.get("expanded_keywords", []) if semantic_data else []
-        # 전역통계로 토큰 정제 (Recall 보장 모드)
-        print(f"    DEBUG: expanded_phrases = {expanded_phrases}")
-        expanded_tokens = filter_semantic_terms_tokens(
-            expanded_phrases, df_global, idf_global, N_global
-        )
-        print(f"    DEBUG: expanded_tokens = {expanded_tokens}")
-
+        # 확장 모드에 따른 토큰 처리
+        if expansion_mode == "unfiltered":
+            # ②번 방식: 정제 없이 무조건적 사용
+            expanded_tokens = filter_semantic_terms_tokens_unfiltered(
+                expanded_phrases, df_global, idf_global, N_global
+            )
+        else:
+            # ③번 방식: 정제된 확장 (기본값)
+            expanded_tokens = filter_semantic_terms_tokens(
+                expanded_phrases, df_global, idf_global, N_global
+            )
+        
         # PRF fallback (확장 토큰이 너무 적을 때만)
         if not expanded_tokens and config.enable_prf_fallback:
             prf_terms = prf_rm3_terms(cand_texts, np.array([base_scores[i] for i in cand_idx]))
-            expanded_tokens = filter_semantic_terms_tokens(
-                prf_terms, df_global, idf_global, N_global
-            )
+            if expansion_mode == "unfiltered":
+                expanded_tokens = filter_semantic_terms_tokens_unfiltered(
+                    prf_terms, df_global, idf_global, N_global
+                )
+            else:
+                expanded_tokens = filter_semantic_terms_tokens(
+                    prf_terms, df_global, idf_global, N_global
+                )
     else:
         # 기존 방식 (호환성)
         df_dict = build_df_dict(cand_texts, tokenize_en)
@@ -553,12 +583,13 @@ def full_document_rerank(query: str, documents: List[str], base_scores: np.ndarr
 # -----------------------------
 def semantic_rerank(query: str, documents: List[str], base_scores: np.ndarray,
                    semantic_data: Optional[Dict[str, Any]], config: KeywordFilterConfig,
-                   df_global: Dict[str,int] = None, idf_global: Dict[str,float] = None, N_global: int = None) -> Tuple[List[int], List[float], Dict[str, Any]]:
+                   df_global: Dict[str,int] = None, idf_global: Dict[str,float] = None, N_global: int = None,
+                   expansion_mode: str = "filtered") -> Tuple[List[int], List[float], Dict[str, Any]]:
     """통합 시맨틱 재랭킹 함수"""
     
     # 적응형 방식 선택
     if config.adaptive_mode and len(documents) <= config.candidate_threshold:
-        return candidate_based_rerank(query, documents, base_scores, semantic_data, config, df_global, idf_global, N_global)
+        return candidate_based_rerank(query, documents, base_scores, semantic_data, config, df_global, idf_global, N_global, expansion_mode)
     else:
         return full_document_rerank(query, documents, base_scores, semantic_data, config)
 

@@ -416,10 +416,10 @@ def run_benchmark(semantic: bool = False,
 # -----------------------------
 # Runner
 # -----------------------------
-def run_three_way_comparison(max_queries: int = 20):
-    """3-way 비교: 순수 BM25 vs 무조건적 확장 vs 정제된 확장"""
+def run_two_way_comparison(max_queries: int = 20):
+    """2-way 비교: 순수 BM25 vs 의미 제약·정제된 확장"""
     print("=" * 60)
-    print("FiQA 3-Way Comparison")
+    print("FiQA 2-Way Comparison")
     print("=" * 60)
     print("Configuration:")
     print(f"  - Max queries: {max_queries}")
@@ -439,19 +439,9 @@ def run_three_way_comparison(max_queries: int = 20):
             out_dir=EXPERIMENT_CONFIG["out_dir"]
         )
 
-        # 2. BM25 + 무조건적 키워드 확장
-        print("\n2. Running BM25 + 무조건적 키워드 확장...")
-        results["unfiltered"] = run_benchmark(
-            semantic=True,
-            split=EXPERIMENT_CONFIG["split"],
-            max_queries=max_queries,
-            out_dir=EXPERIMENT_CONFIG["out_dir"],
-            expansion_mode="unfiltered"
-        )
-
-        # 3. BM25 + 의미 제약·정제된 확장 (제안 기법)
-        print("\n3. Running BM25 + 의미 제약·정제된 확장 (제안 기법)...")
-        results["filtered"] = run_benchmark(
+        # 2. BM25 + 의미 제약·정제된 확장 (제안 기법)
+        print("\n2. Running BM25 + 의미 제약·정제된 확장 (제안 기법)...")
+        results["semantic"] = run_benchmark(
             semantic=True,
             split=EXPERIMENT_CONFIG["split"],
             max_queries=max_queries,
@@ -459,27 +449,45 @@ def run_three_way_comparison(max_queries: int = 20):
             expansion_mode="filtered"
         )
 
-        # 4. 3-way Comparison
+        # 3. 2-way Comparison (Precision 중심 평가)
         print("\n" + "=" * 60)
-        print("3-WAY COMPARISON SUMMARY")
+        print("2-WAY COMPARISON SUMMARY (PRECISION OPTIMIZED)")
         print("=" * 60)
         
         pure_metrics = results["pure"]["metrics"]
-        unfiltered_metrics = results["unfiltered"]["metrics"]
-        filtered_metrics = results["filtered"]["metrics"]
+        semantic_metrics = results["semantic"]["metrics"]
         
-        print(f"P@1     : {pure_metrics['P@1']:.3f} → {unfiltered_metrics['P@1']:.3f} → {filtered_metrics['P@1']:.3f}")
-        print(f"P@10    : {pure_metrics['P@10']:.3f} → {unfiltered_metrics['P@10']:.3f} → {filtered_metrics['P@10']:.3f}")
-        print(f"MRR@10  : {pure_metrics['MRR@10']:.3f} → {unfiltered_metrics['MRR@10']:.3f} → {filtered_metrics['MRR@10']:.3f}")
-        print(f"nDCG@10 : {pure_metrics['nDCG@10']:.3f} → {unfiltered_metrics['nDCG@10']:.3f} → {filtered_metrics['nDCG@10']:.3f}")
-        print(f"R@10    : {pure_metrics['R@10']:.3f} → {unfiltered_metrics['R@10']:.3f} → {filtered_metrics['R@10']:.3f}")
+        # 핵심 지표: Precision (False Positive 최소화)
+        print("🎯 CORE METRICS (Precision - False Positive Minimization):")
+        print(f"P@1     : {pure_metrics['P@1']:.3f} → {semantic_metrics['P@1']:.3f} ({semantic_metrics['P@1'] - pure_metrics['P@1']:+.3f})")
+        print(f"P@10    : {pure_metrics['P@10']:.3f} → {semantic_metrics['P@10']:.3f} ({semantic_metrics['P@10'] - pure_metrics['P@10']:+.3f})")
+        print(f"P@100   : {pure_metrics['P@100']:.3f} → {semantic_metrics['P@100']:.3f} ({semantic_metrics['P@100'] - pure_metrics['P@100']:+.3f})")
         
-        print(f"\nImprovements over Pure BM25:")
-        print(f"  무조건적 확장: R@10 {unfiltered_metrics['R@10'] - pure_metrics['R@10']:+.3f}")
-        print(f"  정제된 확장:   R@10 {filtered_metrics['R@10'] - pure_metrics['R@10']:+.3f}")
+        # 보조 지표: Recall 및 기타
+        print("\n📊 AUXILIARY METRICS:")
+        print(f"R@10    : {pure_metrics['R@10']:.3f} → {semantic_metrics['R@10']:.3f} ({semantic_metrics['R@10'] - pure_metrics['R@10']:+.3f})")
+        print(f"R@100   : {pure_metrics['R@100']:.3f} → {semantic_metrics['R@100']:.3f} ({semantic_metrics['R@100'] - pure_metrics['R@100']:+.3f})")
+        print(f"MRR@10  : {pure_metrics['MRR@10']:.3f} → {semantic_metrics['MRR@10']:.3f} ({semantic_metrics['MRR@10'] - pure_metrics['MRR@10']:+.3f})")
+        print(f"nDCG@10 : {pure_metrics['nDCG@10']:.3f} → {semantic_metrics['nDCG@10']:.3f} ({semantic_metrics['nDCG@10'] - pure_metrics['nDCG@10']:+.3f})")
+        
+        # Precision 개선 요약
+        p1_improvement = semantic_metrics['P@1'] - pure_metrics['P@1']
+        p10_improvement = semantic_metrics['P@10'] - pure_metrics['P@10']
+        p100_improvement = semantic_metrics['P@100'] - pure_metrics['P@100']
+        
+        print(f"\n🎯 PRECISION IMPROVEMENT SUMMARY:")
+        print(f"  P@1 개선:  {p1_improvement:+.3f} ({p1_improvement/pure_metrics['P@1']*100:+.1f}%)")
+        print(f"  P@10 개선: {p10_improvement:+.3f} ({p10_improvement/pure_metrics['P@10']*100:+.1f}%)")
+        print(f"  P@100 개선: {p100_improvement:+.3f} ({p100_improvement/pure_metrics['P@100']*100:+.1f}%)")
+        
+        if p10_improvement > 0:
+            print("✅ Precision 개선 성공: False Positive 감소!")
+        else:
+            print("❌ Precision 개선 실패: 추가 튜닝 필요")
+            
         print("=" * 60)
         
-        # 3-way 비교 결과를 consolidated_results.json으로 저장
+        # 2-way 비교 결과를 consolidated_results.json으로 저장
         consolidated_results = {
             "experiment_info": {
                 "dataset": "mteb/fiqa",
@@ -489,59 +497,55 @@ def run_three_way_comparison(max_queries: int = 20):
                 "experiment_date": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "description": {
                     "pure": "순수 BM25: 기본적인 정보 검색 모델",
-                    "simple": "단순 키워드 확장 BM25: 동의어 기반 확장, 정제 없음",
-                    "semantic": "의미적 확장 BM25: LLM 기반 확장, DF/IDF 정제, FN 최소화"
-                }
+                    "semantic": "의미적 확장 BM25: LLM 기반 확장, Precision 최적화, False Positive 최소화"
+                },
+                "optimization_target": "Precision (False Positive Minimization)"
             },
             "core_metrics": {
-                "R@100": {
-                    "pure": pure_metrics['R@100'],
-                    "simple": unfiltered_metrics['R@100'],
-                    "semantic": filtered_metrics['R@100'],
-                    "improvement_pure_to_semantic": filtered_metrics['R@100'] - pure_metrics['R@100'],
-                    "improvement_simple_to_semantic": filtered_metrics['R@100'] - unfiltered_metrics['R@100']
+                "P@10": {
+                    "pure": pure_metrics['P@10'],
+                    "semantic": semantic_metrics['P@10'],
+                    "improvement_pure_to_semantic": semantic_metrics['P@10'] - pure_metrics['P@10'],
+                    "improvement_percentage": (semantic_metrics['P@10'] - pure_metrics['P@10']) / pure_metrics['P@10'] * 100
                 },
-                "R@10": {
-                    "pure": pure_metrics['R@10'],
-                    "simple": unfiltered_metrics['R@10'],
-                    "semantic": filtered_metrics['R@10'],
-                    "improvement_pure_to_semantic": filtered_metrics['R@10'] - pure_metrics['R@10'],
-                    "improvement_simple_to_semantic": filtered_metrics['R@10'] - unfiltered_metrics['R@10']
+                "P@100": {
+                    "pure": pure_metrics['P@100'],
+                    "semantic": semantic_metrics['P@100'],
+                    "improvement_pure_to_semantic": semantic_metrics['P@100'] - pure_metrics['P@100'],
+                    "improvement_percentage": (semantic_metrics['P@100'] - pure_metrics['P@100']) / pure_metrics['P@100'] * 100
                 }
             },
             "auxiliary_metrics": {
-                "P@10": {
-                    "pure": pure_metrics['P@10'],
-                    "simple": unfiltered_metrics['P@10'],
-                    "semantic": filtered_metrics['P@10']
+                "R@10": {
+                    "pure": pure_metrics['R@10'],
+                    "semantic": semantic_metrics['R@10']
+                },
+                "R@100": {
+                    "pure": pure_metrics['R@100'],
+                    "semantic": semantic_metrics['R@100']
                 },
                 "nDCG@10": {
                     "pure": pure_metrics['nDCG@10'],
-                    "simple": unfiltered_metrics['nDCG@10'],
-                    "semantic": filtered_metrics['nDCG@10']
+                    "semantic": semantic_metrics['nDCG@10']
                 },
                 "MRR@10": {
                     "pure": pure_metrics['MRR@10'],
-                    "simple": unfiltered_metrics['MRR@10'],
-                    "semantic": filtered_metrics['MRR@10']
+                    "semantic": semantic_metrics['MRR@10']
                 }
             },
             "reference_metrics": {
                 "MAP@100": {
                     "pure": pure_metrics['MAP@100'],
-                    "simple": unfiltered_metrics['MAP@100'],
-                    "semantic": filtered_metrics['MAP@100']
+                    "semantic": semantic_metrics['MAP@100']
                 },
                 "nDCG@100": {
                     "pure": pure_metrics['nDCG@100'],
-                    "simple": unfiltered_metrics['nDCG@100'],
-                    "semantic": filtered_metrics['nDCG@100']
+                    "semantic": semantic_metrics['nDCG@100']
                 }
             },
             "detailed_results": {
                 "pure": pure_metrics,
-                "simple": unfiltered_metrics,
-                "semantic": filtered_metrics
+                "semantic": semantic_metrics
             }
         }
         
@@ -556,7 +560,7 @@ def run_three_way_comparison(max_queries: int = 20):
         return results
 
     except Exception as e:
-        print(f"\n\nError during 3-way comparison: {e}")
+        print(f"\n\nError during 2-way comparison: {e}")
         return None
 
 
@@ -564,5 +568,5 @@ if __name__ == "__main__":
     # 환경변수 기반 설정
     max_queries = EXPERIMENT_CONFIG["max_queries"]
     
-    # 항상 3-way 비교 실행
-    run_three_way_comparison(max_queries)
+    # 2-way 비교 실행
+    run_two_way_comparison(max_queries)

@@ -22,29 +22,30 @@ class KeywordFilterConfig:
         self.max_queries = kwargs.get("max_queries", 20)
         self.semantic_sample_rate = kwargs.get("semantic_sample_rate", 1.0)
         
-        # 확장 키워드 설정
-        self.max_expanded = kwargs.get("max_expanded", 8)
-        self.df_thresh = kwargs.get("df_thresh", 0.95)  # MS MARCO 방식 기본값
-        self.idf_min = kwargs.get("idf_min", 0.05)      # MS MARCO 방식 기본값
+        # 확장 키워드 설정 (Precision 최적화)
+        self.max_expanded = kwargs.get("max_expanded", 5)  # 8->5: Precision 향상
+        self.max_precision_tokens = kwargs.get("max_precision_tokens", 5)  # Precision 제한
+        self.df_thresh = kwargs.get("df_thresh", 0.90)  # 0.95->0.90: 더 엄격한 필터링
+        self.idf_min = kwargs.get("idf_min", 0.10)      # 0.05->0.10: 더 엄격한 필터링
+        self.quality_threshold = kwargs.get("quality_threshold", 0.05)  # 품질 임계값
         
         # 재랭킹 방식 설정
         self.adaptive_mode = kwargs.get("adaptive_mode", True)
         self.candidate_threshold = kwargs.get("candidate_threshold", 1000)
         
-        # 후보 기반 설정 (FiQA 스타일) - Recall 중심 튜닝
-        self.top_r_pure = kwargs.get("top_r_pure", 300)  # 200->300: 더 많은 후보 유지
-        self.alpha_soft_bonus = kwargs.get("alpha_soft_bonus", 1.0)  # Recall 우선 강화
-        self.anchor_k = kwargs.get("anchor_k", 5)  # 3->5: 더 많은 앵커 보호
-        self.rrf_k = kwargs.get("rrf_k", 20.0)  # 확장어 효과를 더 강하게 반영
+        # 후보 기반 설정 (FiQA 스타일) - Precision 중심 튜닝
+        self.top_r_pure = kwargs.get("top_r_pure", 200)  # 300->200: Precision 향상
+        self.alpha_soft_bonus = kwargs.get("alpha_soft_bonus", 0.5)  # 1.0->0.5: 보수적 확장
+        self.anchor_k = kwargs.get("anchor_k", 3)  # 5->3: Precision 중심
+        self.rrf_k = kwargs.get("rrf_k", 10.0)  # 20.0->10.0: 보수적 확장어 효과
         
-        # 전체 문서 설정 (MS MARCO 스타일) - Recall 중심 튜닝
-        self.top_r_sem = kwargs.get("top_r_sem", 3000)  # 2000->3000: 더 많은 후보 유지
-        self.expanded_weight = kwargs.get("expanded_weight", 0.25)  # 0.35->0.25: 보수적 확장
-        self.alpha_bonus = kwargs.get("alpha_bonus", 0.3)  # 0.45->0.3: 보수적 보너스
-        # SAFE-DROP 제거됨 - FN 최소화를 위해
+        # 전체 문서 설정 (MS MARCO 스타일) - Precision 중심 튜닝
+        self.top_r_sem = kwargs.get("top_r_sem", 2000)  # 3000->2000: Precision 향상
+        self.expanded_weight = kwargs.get("expanded_weight", 0.15)  # 0.25->0.15: 더 보수적 확장
+        self.alpha_bonus = kwargs.get("alpha_bonus", 0.2)  # 0.3->0.2: 더 보수적 보너스
         
-        # 공통 안전장치 (Recall 중심 튜닝)
-        self.guardrail_k = kwargs.get("guardrail_k", 200)  # 100->200: 더 많은 관련 문서 보호
+        # 공통 안전장치 (Precision 중심 튜닝)
+        self.guardrail_k = kwargs.get("guardrail_k", 150)  # 200->150: Recall 안전판 유지하면서 Precision 향상
         self.enable_prf_fallback = kwargs.get("enable_prf_fallback", True)
         
         # BM25 파라미터
@@ -95,6 +96,74 @@ def terms_to_tokens(terms: List[str]) -> List[str]:
     for phrase in normalize_terms(terms or []):
         toks.extend(tokenize_en(phrase))
     return dedup(toks)
+
+# -----------------------------
+# Precision-oriented Drop Logic
+# -----------------------------
+def _idf_top_threshold(idf_dict: Dict[str, float], pct: float = 0.9) -> float:
+    """IDF 상위 퍼센타일 임계값 계산"""
+    vals = sorted(idf_dict.values())
+    if not vals:
+        return 0.0
+    return vals[int(len(vals) * pct)]
+
+def _count_overlap(tokens: Set[str], q_tokens: Set[str]) -> int:
+    """토큰 집합 간 겹침 개수 계산"""
+    return len(tokens & q_tokens)
+
+def apply_precision_drop_logic(
+    query: str, 
+    documents: List[str], 
+    final_global_order: List[int], 
+    final_scores: List[float],
+    expanded_tokens: List[str],
+    debug_info: Dict[str, Any]
+) -> Tuple[List[int], List[float]]:
+    """Precision 최적화를 위한 조건부 Drop 로직"""
+    
+    # 로컬 IDF 계산 (전역 IDF가 없는 경우를 위해)
+    local_idf = build_idf_dict_from_df(
+        build_df_dict(documents, tokenize_en), 
+        len(documents)
+    )
+    
+    # IDF 상위 90% 임계값
+    idf_cut = _idf_top_threshold(local_idf, pct=0.9)
+    
+    # 쿼리 핵심 토큰 (IDF 상위 90%)
+    q_tokens = set(tokenize_en(query))
+    q_core = {t for t in q_tokens if local_idf.get(t, 0.0) >= idf_cut}
+    
+    # 하위 퍼센타일 컷 (하위 40%는 DROP 후보)
+    cut_rank = int(len(final_global_order) * 0.6)
+    
+    keep_ids, keep_scores = [], []
+    expanded_set = set(expanded_tokens) if isinstance(expanded_tokens, list) else set()
+    
+    debug_info.setdefault("dropped", [])
+    
+    for rank, doc_id in enumerate(final_global_order):
+        doc_tokens, _ = build_doc_token_index([documents[doc_id]], tokenize_en)[0]
+        
+        # Drop 조건 체크
+        cond_expanded_match = len(doc_tokens & expanded_set) == 0
+        cond_core_low = _count_overlap(doc_tokens, q_core) <= 0
+        cond_tail = rank >= cut_rank
+        
+        # 3조건 모두 만족하면 DROP
+        if cond_expanded_match and cond_core_low and cond_tail:
+            debug_info["dropped"].append({
+                "doc_id": int(doc_id),
+                "rank": int(rank),
+                "reason": "no_expanded_match+no_core_overlap+tail",
+                "doc_preview": documents[doc_id][:100] + "..." if len(documents[doc_id]) > 100 else documents[doc_id]
+            })
+            continue
+        
+        keep_ids.append(doc_id)
+        keep_scores.append(final_scores[rank])
+    
+    return keep_ids, keep_scores
 
 
 # -----------------------------
@@ -257,9 +326,10 @@ def filter_semantic_terms_tokens(
     df_global: Dict[str,int],
     idf_global: Dict[str,float],
     N_global: int,
+    config: Optional[KeywordFilterConfig] = None,
     **kwargs
 ) -> List[str]:
-    """확장어 필터: 무조건 최소 1개 이상 확장어를 사용 (Recall 보장 모드)"""
+    """확장어 필터: Precision 최적화 모드 - False Positive 최소화"""
     tokens = []
     for ph in phrases or []:
         for t in tokenize_en(ph):
@@ -267,11 +337,48 @@ def filter_semantic_terms_tokens(
                 tokens.append(t)
     tokens = dedup(tokens)
 
-    kept = tokens[:]  # 대부분 유지
-
-    # 최소 1개는 무조건 사용
+    # Precision 최적화를 위한 강화된 필터링
+    kept = []
+    
+    # 1. DF/IDF 기반 정밀 필터링
+    for token in tokens:
+        df_count = df_global.get(token, 0)
+        idf_score = idf_global.get(token, 0.0)
+        
+        # 더 엄격한 DF 임계값 (너무 일반적인 단어 제거)
+        if df_count > N_global * 0.90:  # 90% 이상 문서에 나타나는 단어 제거
+            continue
+            
+        # 더 엄격한 IDF 임계값 (너무 희귀한 단어 제거)  
+        if idf_score < 0.1:  # IDF가 너무 낮은 단어 제거
+            continue
+            
+        # 키워드 품질 점수 계산 (DF와 IDF의 균형)
+        quality_score = idf_score * (1.0 - (df_count / N_global))
+        
+        # 품질 점수가 임계값 이상인 경우만 유지
+        quality_threshold = config.quality_threshold if config else 0.05
+        if quality_score >= quality_threshold:
+            kept.append(token)
+    
+    # 2. 최대 확장 키워드 수 제한 (Precision 보장)
+    max_precision_tokens = config.max_precision_tokens if config else 5
+    kept = kept[:max_precision_tokens]
+    
+    # 3. Fallback: 너무 적으면 최고 품질 1개라도 유지
     if not kept and tokens:
-        kept = tokens[:1]
+        # 토큰들의 품질 점수 계산하여 최고 품질 1개 선택
+        best_token = None
+        best_score = -1
+        for token in tokens:
+            df_count = df_global.get(token, 0)
+            idf_score = idf_global.get(token, 0.0)
+            quality_score = idf_score * (1.0 - (df_count / N_global))
+            if quality_score > best_score:
+                best_score = quality_score
+                best_token = token
+        if best_token:
+            kept = [best_token]
 
     return kept
 
@@ -382,7 +489,6 @@ def candidate_based_rerank(query: str, documents: List[str], base_scores: np.nda
     # 후보 토큰 인덱스
     cand_texts = [documents[i] for i in cand_idx]
     doc_index = build_doc_token_index(cand_texts, tokenize_en)
-    top_docs_tokens = [doc_index[i][0] for i in range(min(len(cand_idx), config.anchor_k*4))]  # ex) 상위 20
 
     # 전역 통계 사용 여부 확인
     if df_global is not None and idf_global is not None and N_global is not None:
@@ -401,7 +507,7 @@ def candidate_based_rerank(query: str, documents: List[str], base_scores: np.nda
         else:
             # ③번 방식: 정제된 확장 (기본값)
             expanded_tokens = filter_semantic_terms_tokens(
-                expanded_phrases, df_global, idf_global, N_global
+                expanded_phrases, df_global, idf_global, N_global, config
             )
         
         # PRF fallback (확장 토큰이 너무 적을 때만)
@@ -478,6 +584,20 @@ def candidate_based_rerank(query: str, documents: List[str], base_scores: np.nda
         "skipped_by_dfidf": not bool(expanded_tokens),
         "mode": "candidate_based_global_stats" if df_global is not None else "candidate_based"
     }
+    
+    # --- [NEW] Precision-oriented conditional DROP ---
+    if expanded_tokens:  # 확장 토큰이 있을 때만 Drop 로직 적용
+        original_count = len(final_global_order)
+        final_global_order, final_scores = apply_precision_drop_logic(
+            query, documents, final_global_order, final_scores, 
+            expanded_tokens, debug_info
+        )
+        dropped_count = original_count - len(final_global_order)
+        debug_info["precision_drop"] = {
+            "original_count": original_count,
+            "dropped_count": dropped_count,
+            "final_count": len(final_global_order)
+        }
     
     return final_global_order, final_scores, debug_info
 
@@ -604,6 +724,7 @@ class MetricsAccumulator:
         self.n = 0
         self.sum_p1 = 0.0
         self.sum_p10 = 0.0
+        self.sum_p100 = 0.0
         self.sum_r10 = 0.0
         self.sum_r100 = 0.0
         self.sum_mrr10 = 0.0
@@ -626,6 +747,7 @@ class MetricsAccumulator:
         
         p1 = float(ranked_labels[0]) if ranked_labels else 0.0
         p10 = (sum(topk) / max(len(topk), 1)) if topk else 0.0
+        p100 = (sum(top100) / max(len(top100), 1)) if top100 else 0.0
         r10 = (sum(topk) / max(total_rel, 1)) if total_rel > 0 else 0.0
         r100 = (sum(top100) / max(total_rel, 1)) if total_rel > 0 else 0.0
         mrr10 = mrr_at_k(ranked_labels, 10)
@@ -635,6 +757,7 @@ class MetricsAccumulator:
         
         self.sum_p1 += p1
         self.sum_p10 += p10
+        self.sum_p100 += p100
         self.sum_r10 += r10
         self.sum_r100 += r100
         self.sum_mrr10 += mrr10
@@ -662,10 +785,11 @@ class MetricsAccumulator:
     def result(self) -> Dict[str, float]:
         """결과 메트릭 반환"""
         if self.n == 0:
-            return {"P@1":0.0, "P@10":0.0, "R@10":0.0, "R@100":0.0, "MRR@10":0.0, "nDCG@10":0.0, "nDCG@100":0.0, "MAP@100":0.0}
+            return {"P@1":0.0, "P@10":0.0, "P@100":0.0, "R@10":0.0, "R@100":0.0, "MRR@10":0.0, "nDCG@10":0.0, "nDCG@100":0.0, "MAP@100":0.0}
         return {
             "P@1": self.sum_p1 / self.n,
             "P@10": self.sum_p10 / self.n,
+            "P@100": self.sum_p100 / self.n,
             "R@10": self.sum_r10 / self.n,
             "R@100": self.sum_r100 / self.n,
             "MRR@10": self.sum_mrr10 / self.n,

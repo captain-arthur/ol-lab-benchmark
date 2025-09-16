@@ -12,7 +12,7 @@ from rank_bm25 import BM25Okapi
 from k_filter import (
     KeywordFilterConfig, ensure_dir, _key, tokenize_en, 
     build_semantic_data_ollama, semantic_rerank, MetricsAccumulator,
-    build_global_stats
+    build_global_stats, get_or_build_semantic
 )
 
 
@@ -20,7 +20,7 @@ from k_filter import (
 # Configuration
 # -----------------------------
 EXPERIMENT_CONFIG = {
-    "max_queries": 20,           # 기본값: 20
+    "max_queries": 6,            # 기본값: 6 (5개 캐시 히트 + 1개 신규)
     "split": "test",             # mteb/fiqa는 test 사용
     "out_dir": "results/keyword/fiqa"
 }
@@ -33,31 +33,32 @@ except Exception:
 
 # FiQA 전용 설정
 def get_fiqa_config() -> KeywordFilterConfig:
-    """FiQA 데이터셋에 최적화된 설정"""
+    """FiQA 데이터셋에 최적화된 설정 - 정밀도 최적화"""
     return KeywordFilterConfig(
         # 기본 설정
         max_queries=EXPERIMENT_CONFIG["max_queries"],
         semantic_sample_rate=float(os.getenv("OL_SEM_SAMPLE", "1.0")),
         
-        # FiQA에 최적화된 파라미터
-        df_thresh=float(os.getenv("OL_DF_THRESH", "0.80")),    # FiQA 기본값
-        idf_min=float(os.getenv("OL_IDF_MIN", "0.1")),         # FiQA 기본값
-        max_expanded=int(os.getenv("OL_MAX_EXPANDED", "8")),
+        # 정밀도 최적화 파라미터 (매우 엄격)
+        df_thresh=float(os.getenv("OL_DF_THRESH", "0.85")),    # 0.80->0.85: 더 엄격한 필터링
+        idf_min=float(os.getenv("OL_IDF_MIN", "0.15")),        # 0.1->0.15: 더 엄격한 필터링
+        max_expanded=int(os.getenv("OL_MAX_EXPANDED", "3")),   # 8->3: 더 엄격한 확장
+        max_precision_tokens=int(os.getenv("OL_MAX_PRECISION_TOKENS", "3")),  # 3개로 제한
+        quality_threshold=float(os.getenv("OL_QUALITY_THRESHOLD", "0.08")),  # 더 높은 품질 요구
         
-        # 후보 기반 설정 (FiQA 스타일) - Recall 중심 튜닝
-        top_r_pure=300,  # 200->300: 더 많은 후보 유지
-        alpha_soft_bonus=float(os.getenv("OL_ALPHA", "0.3")),  # 0.5->0.3: 보수적 보너스
-        anchor_k=int(os.getenv("OL_ANCHOR_K", "5")),  # 3->5: 더 많은 앵커 보호
-        rrf_k=float(os.getenv("OL_RRF_K", "40.0")),  # 60->40: RRF 가중치 증가
+        # 후보 기반 설정 (FiQA 스타일) - 정밀도 중심 튜닝 (매우 엄격)
+        top_r_pure=int(os.getenv("OL_TOP_R_PURE", "100")),     # 300->100: 더 엄격한 후보 선택
+        alpha_soft_bonus=float(os.getenv("OL_ALPHA", "0.2")),  # 0.3->0.2: 매우 보수적 보너스
+        anchor_k=int(os.getenv("OL_ANCHOR_K", "1")),           # 5->1: 더 엄격한 앵커 보호
+        rrf_k=float(os.getenv("OL_RRF_K", "3.0")),   # 40.0->3.0: 매우 보수적 확장어 효과
         
-        # 전체 문서 설정 (MS MARCO 스타일) - Recall 중심 튜닝
-        top_r_sem=int(os.getenv("OL_TOP_R_SEM", "3000")),  # 1000->3000: 더 많은 후보 유지
-        expanded_weight=0.25,  # 0.35->0.25: 보수적 확장
-        alpha_bonus=0.3,  # 0.45->0.3: 보수적 보너스
-        # SAFE-DROP 완전 제거됨 - FN 최소화를 위해
+        # 전체 문서 설정 (MS MARCO 스타일) - 정밀도 중심 튜닝 (매우 엄격)
+        top_r_sem=int(os.getenv("OL_TOP_R_SEM", "1000")),  # 3000->1000: 더 엄격한 후보 선택
+        expanded_weight=float(os.getenv("OL_EXPANDED_WEIGHT", "0.05")),  # 0.25->0.05: 매우 보수적 확장
+        alpha_bonus=float(os.getenv("OL_ALPHA_BONUS", "0.1")),  # 0.3->0.1: 매우 보수적 보너스
         
-        # 공통 안전장치 (Recall 중심 튜닝)
-        guardrail_k=int(os.getenv("OL_GUARDRAIL_K", "200")),  # 100->200: 더 많은 관련 문서 보호
+        # 공통 안전장치 (정밀도 중심 튜닝 - 매우 엄격)
+        guardrail_k=int(os.getenv("OL_GUARDRAIL_K", "50")),   # 200->50: 매우 엄격한 가드레일
         enable_prf_fallback=True,
         
         # BM25 파라미터
@@ -155,9 +156,7 @@ def run_benchmark(semantic: bool = False,
     # 설정 로드
     config = get_fiqa_config()
 
-    # 캐시 초기화/프리로드 (성능 최적화)
-    cache: List[Dict[str, Any]] = []
-    cache_dict: Dict[str, Dict[str, Any]] = {}  # 빠른 조회를 위한 딕셔너리
+    # 파일 캐시 시스템
     cache_path = None
     semantic_data_path = None
     mode = "semantic" if semantic else "pure"
@@ -171,49 +170,7 @@ def run_benchmark(semantic: bool = False,
         cache_dir = ".cache/keyword/fiqa"
         ensure_dir(cache_dir)
         cache_path = os.path.join(cache_dir, "ollama_cache.json")
-
-        # 기존 캐시 로드 (성능 최적화)
-        if os.path.exists(cache_path):
-            try:
-                loaded = json.load(open(cache_path, "r", encoding="utf-8"))
-                if isinstance(loaded, list):
-                    cache = loaded
-                    # 빠른 조회를 위한 딕셔너리 구축 (품질 우선순위)
-                    for item in cache:
-                        k = _key(item.get("query", ""))
-                        if k not in cache_dict:
-                            # 첫 번째 엔트리
-                            cache_dict[k] = item
-                        else:
-                            # 기존 엔트리와 품질 비교
-                            existing = cache_dict[k]
-                            existing_keywords = existing.get("expanded", {}).get("keywords", [])
-                            new_keywords = item.get("expanded", {}).get("keywords", [])
-                            
-                            # 더 많은 키워드를 가진 엔트리 우선
-                            if len(new_keywords) > len(existing_keywords):
-                                cache_dict[k] = item
-                    print(f"Loaded {len(cache)} cached semantic expansions")
-            except Exception:
-                cache = []
-
-        # 기존 semantic_data.jsonl → 캐시 보강
-        if os.path.exists(semantic_data_path):
-            with open(semantic_data_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        row = json.loads(line)
-                        q = row.get("query", "")
-                        if not q:
-                            continue
-                        ek = []
-                        if isinstance(row.get("expanded"), dict):
-                            ek = row["expanded"].get("keywords", [])
-                        if not ek:
-                            ek = row.get("expanded_keywords", [])
-                        cache.append({"query": q, "expanded": {"keywords": ek}})
-                    except Exception:
-                        continue
+        print("Using file cache system")
 
     # 메트릭 누적
     metrics = MetricsAccumulator()
@@ -243,54 +200,13 @@ def run_benchmark(semantic: bool = False,
         sem_data = None
         if semantic and (np.random.rand() < config.semantic_sample_rate):
             metrics.add_sem_attempt()
-            k = _key(qtext)
-            
-            # 캐시 조회 (O(1) 딕셔너리 조회)
-            if k in cache_dict:
-                item = cache_dict[k]
-                # 품질 검증: 확장 키워드가 충분한지 확인
-                expanded = item.get("expanded", {})
-                keywords = expanded.get("keywords", []) if isinstance(expanded, dict) else []
-                if len(keywords) >= 3:  # 최소 3개 이상의 확장 키워드 필요
-                    sem_data = item
-                    hits += 1
-                    print(f"  ✓ Cache HIT: {len(keywords)} keywords")
-                else:
-                    print(f"  ⚠ Cache HIT but low quality: {len(keywords)} keywords")
-            else:
-                print(f"  ✗ Cache MISS: calling LLM...")
-            
-            if sem_data is None:
+            # 의미적 확장 모드에서만 LLM 호출
+            if semantic:  # 순정 BM25 모드에서는 LLM 호출하지 않음
                 misses += 1
-                sem_data = build_semantic_data_ollama(
-                    qtext, 
-                    host=config.ollama_host,
-                    model=config.ollama_model,
-                    timeout=config.ollama_timeout,
-                    retries=config.ollama_retries
-                )
+                sem_data = get_or_build_semantic(qtext, config, cache_path)
                 
-                # 품질 검증 후 캐시에 추가
-                if sem_data:
-                    expanded = sem_data.get("expanded", {})
-                    keywords = expanded.get("keywords", []) if isinstance(expanded, dict) else []
-                    if len(keywords) >= 3:  # 품질이 좋은 경우만 캐시에 추가
-                        # 중복 체크 후 추가 (O(1) 딕셔너리 조회)
-                        k_new = _key(sem_data.get("query", ""))
-                        if k_new not in cache_dict:
-                            cache.append(sem_data)
-                            cache_dict[k_new] = sem_data
-                            print(f"  ✓ Added to cache: {len(keywords)} keywords")
-                            if cache_path is not None:
-                                try:
-                                    json.dump(cache, open(cache_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-                                except Exception:
-                                    pass
-                        else:
-                            print(f"  ⚠ Duplicate detected, not cached")
-                    else:
-                        print(f"  ⚠ Low quality LLM response: {len(keywords)} keywords, not cached")
-                else:
+                # 새로운 캐시 함수가 자동으로 처리 (6~10개 키워드만 캐시)
+                if not sem_data:
                     print(f"  ✗ LLM call failed")
         else:
             print(f"  → Pure BM25 mode (no semantic expansion)")
@@ -407,7 +323,15 @@ def run_benchmark(semantic: bool = False,
     if semantic and "semantic_debug" in meta:
         dbg = meta["semantic_debug"]
         print(f"  sem_applied={dbg['sem_applied']}/{dbg['sem_attempted']}, skipped_by_dfidf={dbg['skipped_by_dfidf']}")
-        print(f"  cache_hits={hits}, cache_misses={misses}, cache_size={len(cache)}")
+        cache_size = 0
+        if cache_path and os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+                    cache_size = len(cache_data)
+            except Exception:
+                cache_size = 0
+        print(f"  cache_hits={hits}, cache_misses={misses}, cache_size={cache_size}")
     print(f" - Metrics : {metrics_path}")
 
     return meta

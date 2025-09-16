@@ -4,6 +4,7 @@ import json
 import re
 import math
 import time
+import hashlib
 from typing import List, Dict, Any, Tuple, Optional, Set, Iterable
 
 import numpy as np
@@ -22,30 +23,30 @@ class KeywordFilterConfig:
         self.max_queries = kwargs.get("max_queries", 20)
         self.semantic_sample_rate = kwargs.get("semantic_sample_rate", 1.0)
         
-        # 확장 키워드 설정 (Precision 최적화)
-        self.max_expanded = kwargs.get("max_expanded", 5)  # 8->5: Precision 향상
-        self.max_precision_tokens = kwargs.get("max_precision_tokens", 5)  # Precision 제한
-        self.df_thresh = kwargs.get("df_thresh", 0.90)  # 0.95->0.90: 더 엄격한 필터링
-        self.idf_min = kwargs.get("idf_min", 0.10)      # 0.05->0.10: 더 엄격한 필터링
-        self.quality_threshold = kwargs.get("quality_threshold", 0.05)  # 품질 임계값
+        # 확장 키워드 설정 (Precision 최적화 - 매우 엄격)
+        self.max_expanded = kwargs.get("max_expanded", 3)  # 5->3: 더 엄격한 확장
+        self.max_precision_tokens = kwargs.get("max_precision_tokens", 3)  # 5->3: 더 엄격한 제한
+        self.df_thresh = kwargs.get("df_thresh", 0.85)  # 0.90->0.85: 더 엄격한 필터링
+        self.idf_min = kwargs.get("idf_min", 0.15)      # 0.10->0.15: 더 엄격한 필터링
+        self.quality_threshold = kwargs.get("quality_threshold", 0.08)  # 0.05->0.08: 더 높은 품질 요구
         
         # 재랭킹 방식 설정
         self.adaptive_mode = kwargs.get("adaptive_mode", True)
         self.candidate_threshold = kwargs.get("candidate_threshold", 1000)
         
-        # 후보 기반 설정 (FiQA 스타일) - Precision 중심 튜닝
-        self.top_r_pure = kwargs.get("top_r_pure", 200)  # 300->200: Precision 향상
-        self.alpha_soft_bonus = kwargs.get("alpha_soft_bonus", 0.5)  # 1.0->0.5: 보수적 확장
-        self.anchor_k = kwargs.get("anchor_k", 3)  # 5->3: Precision 중심
-        self.rrf_k = kwargs.get("rrf_k", 10.0)  # 20.0->10.0: 보수적 확장어 효과
+        # 후보 기반 설정 (FiQA 스타일) - Precision 중심 튜닝 (매우 엄격)
+        self.top_r_pure = kwargs.get("top_r_pure", 100)  # 200->100: 더 엄격한 후보 선택
+        self.alpha_soft_bonus = kwargs.get("alpha_soft_bonus", 0.2)  # 0.5->0.2: 매우 보수적 확장
+        self.anchor_k = kwargs.get("anchor_k", 1)  # 3->1: 더 엄격한 앵커 보호
+        self.rrf_k = kwargs.get("rrf_k", 3.0)  # 10.0->3.0: 매우 보수적 확장어 효과
         
-        # 전체 문서 설정 (MS MARCO 스타일) - Precision 중심 튜닝
-        self.top_r_sem = kwargs.get("top_r_sem", 2000)  # 3000->2000: Precision 향상
-        self.expanded_weight = kwargs.get("expanded_weight", 0.15)  # 0.25->0.15: 더 보수적 확장
-        self.alpha_bonus = kwargs.get("alpha_bonus", 0.2)  # 0.3->0.2: 더 보수적 보너스
+        # 전체 문서 설정 (MS MARCO 스타일) - Precision 중심 튜닝 (매우 엄격)
+        self.top_r_sem = kwargs.get("top_r_sem", 1000)  # 2000->1000: 더 엄격한 후보 선택
+        self.expanded_weight = kwargs.get("expanded_weight", 0.05)  # 0.15->0.05: 매우 보수적 확장
+        self.alpha_bonus = kwargs.get("alpha_bonus", 0.1)  # 0.2->0.1: 매우 보수적 보너스
         
-        # 공통 안전장치 (Precision 중심 튜닝)
-        self.guardrail_k = kwargs.get("guardrail_k", 150)  # 200->150: Recall 안전판 유지하면서 Precision 향상
+        # 공통 안전장치 (Precision 중심 튜닝 - 매우 엄격)
+        self.guardrail_k = kwargs.get("guardrail_k", 50)  # 150->50: 매우 엄격한 가드레일
         self.enable_prf_fallback = kwargs.get("enable_prf_fallback", True)
         
         # BM25 파라미터
@@ -69,6 +70,80 @@ def ensure_dir(p: str):
 def _key(q: str) -> str:
     """쿼리 정규화 키 생성"""
     return re.sub(r"\s+", " ", (q or "").strip().lower())
+
+def _norm_key(s: str) -> str:
+    """키 정규화 함수"""
+    # 공백 축약 + 소문자
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+def _semexp_cache_key(model: str, prompt: str, query: str) -> str:
+    """시맨틱 확장 캐시 키 생성"""
+    pv = PROMPT_VERSION + "|" + prompt  # 프롬프트 문자열 자체를 반영
+    phash = hashlib.sha1(pv.encode("utf-8")).hexdigest()[:12]
+    return f"semexp:{model}:{phash}:{_norm_key(query)}"
+
+# 파일 캐시 시스템 (간단한 구조)
+def get_semexp_cache(model: str, prompt: str, query: str, cache_path: str = None):
+    """시맨틱 확장 캐시 조회"""
+    if not cache_path or not os.path.exists(cache_path):
+        return None
+    
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            cache_data = json.load(f)
+        
+        # 쿼리 정규화
+        normalized_query = _norm_key(query)
+        
+        # 배열에서 해당 쿼리 찾기
+        for entry in cache_data:
+            if _norm_key(entry.get("query", "")) == normalized_query:
+                return entry
+        
+        return None
+    except Exception:
+        return None
+
+def set_semexp_cache(model: str, prompt: str, query: str, value: Dict[str, Any], cache_path: str = None):
+    """시맨틱 확장 캐시 저장 - 6~10개 보장인 경우만 저장"""
+    if not cache_path:
+        return
+    
+    kws = (value or {}).get("expanded", {}).get("keywords", [])
+    
+    if isinstance(kws, list) and 6 <= len(kws) <= 10:
+        # 기존 캐시 로드
+        cache_data = []
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+                    if not isinstance(cache_data, list):
+                        cache_data = []
+            except Exception:
+                cache_data = []
+        
+        # 쿼리 정규화
+        normalized_query = _norm_key(query)
+        
+        # 중복 체크 및 업데이트
+        found = False
+        for i, entry in enumerate(cache_data):
+            if _norm_key(entry.get("query", "")) == normalized_query:
+                cache_data[i] = value  # 업데이트
+                found = True
+                break
+        
+        if not found:
+            cache_data.append(value)  # 새 항목 추가
+        
+        # 파일에 저장
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
 def tokenize_en(text: str) -> List[str]:
     """영어 텍스트 토큰화"""
@@ -258,33 +333,46 @@ def build_df_dict(passages: List[str], tokenizer=tokenize_en) -> Dict[str, int]:
 # -----------------------------
 # Semantic Expansion
 # -----------------------------
+
+# 프롬프트 버전 관리
+PROMPT_VERSION = "semexp_v3_strict_6to10_finance"
+
+def _prompt_semexp(query: str) -> str:
+    """강화된 시맨틱 확장 프롬프트"""
+    return f"""You are a strict query-expansion assistant for financial IR.
+
+RETURN FORMAT (MANDATORY):
+- Return ONLY a single valid JSON object. No prose, no markdown.
+- Schema:
+{{
+  "user_query": "{query}",
+  "expanded": {{
+    "keywords": ["kw1", "kw2", "kw3", "kw4", "kw5", "kw6"]
+  }}
+}}
+
+HARD CONSTRAINTS (ALL MUST HOLD):
+1) The array "keywords" MUST contain AT LEAST 6 and AT MOST 10 items
+   — never fewer than 6, never more than 10.
+2) Each keyword MUST be 2–4 words, all lowercase, distinct, no duplicates.
+3) Use finance/technical terms tied to the intent of the query; avoid generic words.
+4) Exclude stopwords (e.g., "and", "the", "for", "with", "from").
+
+SELF-CORRECTION RULE:
+- If your first draft violates ANY constraint, rewrite and output a corrected JSON that satisfies ALL constraints.
+
+Query: "{query}"
+""".strip()
+
 def build_semantic_data_ollama(query: str,
                                host: str = "http://192.168.45.166:11434",
                                model: str = "gemma3",
                                timeout: int = 15,
                                retries: int = 2) -> Optional[Dict[str, Any]]:
-    """LLM을 통한 시맨틱 확장 데이터 생성"""
-    prompt = f"""
-You are a query expansion assistant for information retrieval. Return ONLY a valid JSON object without any code fences, markdown, or additional text.
-
-Schema:
-{{
-  "user_query": "<original query>",
-  "expanded": {{
-    "keywords": ["6-10 short distinct phrases, 2-4 words each, lowercase"]
-  }}
-}}
-
-Rules:
-- expanded.keywords must have 6-10 items.
-- Each phrase <=4 words, distinct, lowercase.
-- No filler words (e.g., "and", "from"), no duplicates.
-- No additional fields or commentary.
-- Return ONLY the JSON object, nothing else.
-
-Query: "{query}"
-""".strip()
-
+    """LLM을 통한 시맨틱 확장 데이터 생성 - 강화된 프롬프트와 엄격한 검증"""
+    
+    prompt = _prompt_semexp(query)
+    
     for attempt in range(retries + 1):
         try:
             resp = requests.post(
@@ -293,7 +381,11 @@ Query: "{query}"
                     "model": model,
                     "prompt": prompt,
                     "stream": False,
-                    "options": {"temperature": 0}
+                    "options": {
+                        "temperature": 0,  # 일관성 최대화
+                        "top_p": 1.0,
+                        "repeat_penalty": 1.1
+                    }
                 },
                 timeout=timeout,
             )
@@ -301,21 +393,196 @@ Query: "{query}"
             data = resp.json()
             text = (data.get("response") or "").strip()
             
-            # 안전한 JSON 추출
-            first, last = text.find("{"), text.rfind("}")
-            if first == -1 or last == -1:
-                continue
-            obj = json.loads(text[first:last+1])
-            expanded = obj.get("expanded", {}) if isinstance(obj.get("expanded"), dict) else {}
-            return {
-                "query": obj.get("user_query", query),
-                "expanded": {"keywords": expanded.get("keywords", []) or []}
-            }
+            # 엄격한 JSON 추출 및 검증
+            parsed = _extract_and_validate_json_strict(text, query)
+            if parsed:  # ✅ 6~10개 충족
+                return parsed
+                
         except Exception:
-            if attempt == retries:
-                return None
+            pass
+        
+        # 재시도 대기
+        if attempt < retries:
             time.sleep(0.4 * (attempt + 1))
+    
+    # 모든 시도 실패 → Fallback
+    return _generate_fallback_keywords(query)
+
+def get_or_build_semantic(query: str, cfg: KeywordFilterConfig, cache_path: str = None) -> Optional[Dict[str, Any]]:
+    """캐시를 활용한 시맨틱 확장 데이터 생성"""
+    prompt = _prompt_semexp(query)
+    cached = get_semexp_cache(cfg.ollama_model, prompt, query, cache_path)
+    if cached:
+        print(f"  ✓ Cache HIT: {len(cached.get('expanded', {}).get('keywords', []))} keywords")
+        return cached
+    
+    print(f"  ✗ Cache MISS: calling LLM...")
+    result = build_semantic_data_ollama(query, cfg.ollama_host, cfg.ollama_model, cfg.ollama_timeout, cfg.ollama_retries)
+    if result:
+        set_semexp_cache(cfg.ollama_model, prompt, query, result, cache_path)  # ✅ 6~10개 조건 만족 시에만 저장
+        print(f"  ✓ Added to cache: {len(result.get('expanded', {}).get('keywords', []))} keywords")
+    return result
+
+def _extract_and_validate_json_strict(text: str, original_query: str) -> Optional[Dict[str, Any]]:
+    """엄격한 JSON 추출 및 검증 - 6~10개 키워드 강제"""
+    # 후보 JSON 블록들을 최대한 뽑아내어 하나라도 유효하면 통과
+    candidates = []
+    try:
+        # 1) 첫 { ~ 마지막 } 블록
+        a, b = text.find("{"), text.rfind("}")
+        if a != -1 and b != -1 and b > a:
+            candidates.append(text[a:b+1])
+        # 2) ```json 블록
+        p = text.find("```json")
+        if p != -1:
+            p2 = text.find("```", p+7)
+            if p2 != -1:
+                candidates.append(text[p+7:p2].strip())
+        # 3) 일반 ``` 블록
+        p = text.find("```")
+        if p != -1:
+            p2 = text.find("```", p+3)
+            if p2 != -1:
+                candidates.append(text[p+3:p2].strip())
+    except Exception:
+        pass
+
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+            kws = obj.get("expanded", {}).get("keywords", [])
+            if not isinstance(kws, list): 
+                continue
+
+            # 정제: 소문자/트림/2~4어절/중복 제거
+            cleaned = []
+            seen = set()
+            for kw in kws:
+                if not isinstance(kw, str): 
+                    continue
+                s = " ".join(kw.lower().split())
+                wc = len(s.split())
+                if 2 <= wc <= 4 and s and s not in seen:
+                    cleaned.append(s); seen.add(s)
+
+            if 6 <= len(cleaned) <= 10:
+                return {
+                    "query": obj.get("user_query", original_query),
+                    "expanded": {"keywords": cleaned}
+                }
+        except Exception:
+            continue
     return None
+
+def _extract_and_validate_json(text: str, original_query: str) -> Optional[Dict[str, Any]]:
+    """JSON 추출 및 검증 - 더 강력한 파싱"""
+    try:
+        # 여러 방법으로 JSON 추출 시도
+        json_candidates = []
+        
+        # 방법 1: 첫 번째 { 부터 마지막 } 까지
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            json_candidates.append(text[first_brace:last_brace+1])
+        
+        # 방법 2: ```json 블록 내부
+        json_start = text.find("```json")
+        if json_start != -1:
+            json_start += 7
+            json_end = text.find("```", json_start)
+            if json_end != -1:
+                json_candidates.append(text[json_start:json_end].strip())
+        
+        # 방법 3: ``` 블록 내부
+        code_start = text.find("```")
+        if code_start != -1:
+            code_start += 3
+            code_end = text.find("```", code_start)
+            if code_end != -1:
+                json_candidates.append(text[code_start:code_end].strip())
+        
+        # 각 후보를 시도
+        for candidate in json_candidates:
+            try:
+                obj = json.loads(candidate)
+                keywords = obj.get("expanded", {}).get("keywords", [])
+                
+                # 키워드 검증
+                if isinstance(keywords, list) and len(keywords) >= 6:
+                    # 키워드 정제
+                    cleaned_keywords = []
+                    for kw in keywords:
+                        if isinstance(kw, str):
+                            cleaned = kw.strip().lower()
+                            if 2 <= len(cleaned.split()) <= 4 and cleaned:
+                                cleaned_keywords.append(cleaned)
+                    
+                    if len(cleaned_keywords) >= 6:
+                        return {
+                            "query": obj.get("user_query", original_query),
+                            "expanded": {"keywords": cleaned_keywords[:10]}  # 최대 10개로 제한
+                        }
+            except json.JSONDecodeError:
+                continue
+                
+    except Exception:
+        pass
+    
+    return None
+
+def _generate_fallback_keywords(query: str) -> Dict[str, Any]:
+    """LLM 실패 시 fallback 키워드 생성 - 6~10개 보장"""
+    # 쿼리에서 핵심 단어 추출
+    words = query.lower().split()
+    
+    # 불용어 제거
+    stopwords = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "what", "how", "when", "where", "why", "which", "who"}
+    
+    filtered_words = [w for w in words if w not in stopwords and len(w) > 2]
+    
+    # 2-4어절 키워드 생성
+    fallback_keywords = []
+    
+    # 2어절 조합 (우선순위)
+    for i in range(len(filtered_words) - 1):
+        if len(fallback_keywords) >= 10:
+            break
+        phrase = f"{filtered_words[i]} {filtered_words[i+1]}"
+        fallback_keywords.append(phrase)
+    
+    # 3어절 조합
+    for i in range(len(filtered_words) - 2):
+        if len(fallback_keywords) >= 10:
+            break
+        phrase = f"{filtered_words[i]} {filtered_words[i+1]} {filtered_words[i+2]}"
+        fallback_keywords.append(phrase)
+    
+    # 4어절 조합
+    for i in range(len(filtered_words) - 3):
+        if len(fallback_keywords) >= 10:
+            break
+        phrase = f"{filtered_words[i]} {filtered_words[i+1]} {filtered_words[i+2]} {filtered_words[i+3]}"
+        fallback_keywords.append(phrase)
+    
+    # 최소 6개 보장 (부족한 경우 보충)
+    while len(fallback_keywords) < 6 and filtered_words:
+        word = filtered_words[0] if filtered_words else "analysis"
+        fallback_keywords.extend([
+            f"{word} analysis",
+            f"{word} evaluation", 
+            f"{word} strategy",
+            f"{word} management",
+            f"{word} planning",
+            f"{word} optimization"
+        ])
+        break
+    
+    # 최대 10개로 제한
+    return {
+        "query": query,
+        "expanded": {"keywords": fallback_keywords[:10]}
+    }
 
 
 # -----------------------------
@@ -329,7 +596,9 @@ def filter_semantic_terms_tokens(
     config: Optional[KeywordFilterConfig] = None,
     **kwargs
 ) -> List[str]:
-    """확장어 필터: Precision 최적화 모드 - False Positive 최소화"""
+    """확장어 필터: Precision 최적화 모드 - False Positive 최소화 강화"""
+    
+    # 1단계: 구문에서 토큰 추출 및 기본 정제
     tokens = []
     for ph in phrases or []:
         for t in tokenize_en(ph):
@@ -337,49 +606,77 @@ def filter_semantic_terms_tokens(
                 tokens.append(t)
     tokens = dedup(tokens)
 
-    # Precision 최적화를 위한 강화된 필터링
-    kept = []
-    
-    # 1. DF/IDF 기반 정밀 필터링
+    if not tokens:
+        return []
+
+    # 2단계: 정밀도 중심 품질 점수 계산
+    scored_tokens = []
     for token in tokens:
         df_count = df_global.get(token, 0)
         idf_score = idf_global.get(token, 0.0)
         
-        # 더 엄격한 DF 임계값 (너무 일반적인 단어 제거)
-        if df_count > N_global * 0.90:  # 90% 이상 문서에 나타나는 단어 제거
-            continue
-            
-        # 더 엄격한 IDF 임계값 (너무 희귀한 단어 제거)  
-        if idf_score < 0.1:  # IDF가 너무 낮은 단어 제거
-            continue
-            
-        # 키워드 품질 점수 계산 (DF와 IDF의 균형)
-        quality_score = idf_score * (1.0 - (df_count / N_global))
+        # 더 엄격한 필터링 조건
+        df_ratio = df_count / N_global if N_global > 0 else 0
         
-        # 품질 점수가 임계값 이상인 경우만 유지
-        quality_threshold = config.quality_threshold if config else 0.05
+        # 조건 1: 너무 일반적인 단어 제거 (85% 이상 문서에 나타남)
+        if df_ratio > 0.85:
+            continue
+            
+        # 조건 2: 너무 희귀한 단어 제거 (IDF < 0.15)
+        if idf_score < 0.15:
+            continue
+            
+        # 조건 3: 토큰 길이 체크 (너무 짧거나 긴 토큰 제거)
+        if len(token) < 3 or len(token) > 15:
+            continue
+        
+        # 정밀도 중심 품질 점수 계산
+        base_quality = idf_score * (1.0 - df_ratio)
+        
+        # 추가 품질 지표
+        length_bonus = min(0.1, (len(token) - 3) * 0.02) if len(token) > 3 else 0.0
+        noise_penalty = 0.0
+        
+        # 숫자나 특수문자 포함 시 페널티
+        if any(c.isdigit() for c in token) or any(c in ".,!?;:" for c in token):
+            noise_penalty = 0.1
+        
+        # 최종 품질 점수
+        quality_score = base_quality + length_bonus - noise_penalty
+        
+        # 높은 품질 임계값 적용
+        quality_threshold = config.quality_threshold if config else 0.08
         if quality_score >= quality_threshold:
-            kept.append(token)
+            scored_tokens.append((token, quality_score, idf_score, df_ratio))
     
-    # 2. 최대 확장 키워드 수 제한 (Precision 보장)
-    max_precision_tokens = config.max_precision_tokens if config else 5
-    kept = kept[:max_precision_tokens]
+    # 3단계: 품질 점수 기준 정렬 및 선택
+    scored_tokens.sort(key=lambda x: x[1], reverse=True)  # 품질 점수 기준 내림차순
     
-    # 3. Fallback: 너무 적으면 최고 품질 1개라도 유지
+    # 최대 토큰 수 제한 (정밀도 보장)
+    max_tokens = config.max_precision_tokens if config else 3
+    kept = [token for token, _, _, _ in scored_tokens[:max_tokens]]
+    
+    # 4단계: 최소 보장 로직 (정밀도 유지하면서 최소 1개는 보장)
     if not kept and tokens:
-        # 토큰들의 품질 점수 계산하여 최고 품질 1개 선택
+        # 모든 토큰 중에서 가장 나은 것 선택
         best_token = None
         best_score = -1
+        
         for token in tokens:
             df_count = df_global.get(token, 0)
             idf_score = idf_global.get(token, 0.0)
-            quality_score = idf_score * (1.0 - (df_count / N_global))
-            if quality_score > best_score:
-                best_score = quality_score
-                best_token = token
+            df_ratio = df_count / N_global if N_global > 0 else 0
+            
+            # 최소한의 조건만 적용
+            if df_ratio <= 0.95 and idf_score >= 0.05:  # 매우 관대한 조건
+                quality_score = idf_score * (1.0 - df_ratio)
+                if quality_score > best_score:
+                    best_score = quality_score
+                    best_token = token
+        
         if best_token:
             kept = [best_token]
-
+    
     return kept
 
 

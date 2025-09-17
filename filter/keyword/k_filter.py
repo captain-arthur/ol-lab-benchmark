@@ -408,8 +408,8 @@ Output JSON schema:
 def build_semantic_data_ollama(query: str,
                                host: str = "http://192.168.45.166:11434",
                                model: str = "gemma3",
-                               timeout: int = 15,
-                               retries: int = 2) -> Optional[Dict[str, Any]]:
+                               timeout: int = 8,  # 15 -> 8초로 단축
+                               retries: int = 1) -> Optional[Dict[str, Any]]:  # 2 -> 1회로 감소
     """LLM을 통한 시맨틱 확장 데이터 생성 - 강화된 프롬프트와 엄격한 검증"""
     
     prompt = _prompt_semexp(query)
@@ -906,7 +906,7 @@ def precision_optimized_keyword_filter(
         metrics_stage3 = evaluate_filtering_stage("recall_adjustment", [], [], relevant_docs)
     stage_metrics.append(metrics_stage3)
     
-    # 최종 Drop Precision 계산 (전체 파이프라인 기준)
+    # 최종 Drop Precision 계산 (전체 파이프라인 기준) - 속도 최적화
     # 전체 문서에서 최종 Keep된 문서를 제외한 나머지가 Drop
     final_keep_docs = recall_adjusted
     final_metrics = evaluate_filtering_stage("final_pipeline", documents, final_keep_docs, relevant_docs)

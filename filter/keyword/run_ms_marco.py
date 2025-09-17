@@ -61,11 +61,11 @@ def get_ms_marco_config() -> KeywordFilterConfig:
         k1=1.5,
         b=0.75,
         
-        # LLM 설정
+        # LLM 설정 (속도 최적화)
         ollama_host=os.getenv("OLLAMA_HOST", "http://192.168.45.166:11434"),
         ollama_model=os.getenv("OLLAMA_MODEL", "gemma3"),
-        ollama_timeout=15,
-        ollama_retries=2,
+        ollama_timeout=8,  # 15 -> 8초로 단축
+        ollama_retries=1,  # 2 -> 1회로 감소
     )
 
 def get_precision_optimized_config() -> KeywordFilterConfig:
@@ -99,11 +99,11 @@ def get_precision_optimized_config() -> KeywordFilterConfig:
         k1=1.5,
         b=0.75,
         
-        # LLM 설정
+        # LLM 설정 (속도 최적화)
         ollama_host=os.getenv("OLLAMA_HOST", "http://192.168.45.166:11434"),
         ollama_model=os.getenv("OLLAMA_MODEL", "gemma3"),
-        ollama_timeout=15,
-        ollama_retries=2,
+        ollama_timeout=8,  # 15 -> 8초로 단축
+        ollama_retries=1,  # 2 -> 1회로 감소
     )
 
 def get_extreme_precision_config() -> KeywordFilterConfig:
@@ -137,11 +137,11 @@ def get_extreme_precision_config() -> KeywordFilterConfig:
         k1=1.5,
         b=0.75,
         
-        # LLM 설정
+        # LLM 설정 (속도 최적화)
         ollama_host=os.getenv("OLLAMA_HOST", "http://192.168.45.166:11434"),
         ollama_model=os.getenv("OLLAMA_MODEL", "gemma3"),
-        ollama_timeout=15,
-        ollama_retries=2,
+        ollama_timeout=8,  # 15 -> 8초로 단축
+        ollama_retries=1,  # 2 -> 1회로 감소
     )
 
 
@@ -208,12 +208,13 @@ def run_benchmark(semantic: bool,
     else:
         config = get_ms_marco_config()
 
-        # 기존 캐시 로드
+        # 기존 캐시 로드 (속도 최적화)
         if cache_path and os.path.exists(cache_path):
             try:
                 loaded = json.load(open(cache_path, "r", encoding="utf-8"))
                 if isinstance(loaded, list):
                     cache = loaded
+                    print(f"  📦 캐시 로드: {len(cache)}개 항목")
             except Exception:
                 cache = []
 
@@ -372,8 +373,8 @@ def run_benchmark(semantic: bool,
             metrics.add_skipped_by_dfidf()
         metrics.add(final_labels, total_rel_all=sum(labels), sem_applied=debug_info.get("semantic_applied", False))
 
-        # 진행 상황 로그 (간소화)
-        if q_idx <= 3 or q_idx % 10 == 0 or q_idx == max_queries:
+        # 진행 상황 로그 (속도 최적화 - 더 간소화)
+        if q_idx <= 2 or q_idx % 5 == 0 or q_idx == max_queries:
             sem_used = 'Y' if debug_info.get("semantic_applied", False) else ('-' if not sem_data else 'N')
             print(f"[{mode}] Q{q_idx}/{max_queries} sem_used={sem_used}")
 

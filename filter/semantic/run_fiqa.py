@@ -924,10 +924,10 @@ def compute_cbc_thresholds(scores: np.ndarray, percentile: float = 20.0,
 def calculate_adaptive_percentiles(sbert_characteristics, ce_characteristics, anchor_characteristics):
     """분포 특성에 따른 적응적 퍼센타일 계산"""
     
-    # 기본 퍼센타일 (균형 잡힌 분포 기준) - 최적화된 설정
-    base_sbert_percentile = 40.0
-    base_ce_percentile = 70.0
-    base_anchor_percentile = 40.0
+    # 기본 퍼센타일 (1차 개선 - 최적 성능 설정)
+    base_sbert_percentile = 35.0  # 하위 65% 제거 (최적 재현율)
+    base_ce_percentile = 65.0     # 엄격한 CE 필터링
+    base_anchor_percentile = 45.0 # 적당한 앵커 구제
     
     # SBERT 분포 특성에 따른 조정
     if sbert_characteristics["type"] == "high_concentration":

@@ -65,12 +65,73 @@ def is_confident(order_baseline, scores_this, order_this,
         margin = 0.0
     return (overlap >= overlap_thr) or (margin >= margin_thr)
 
+def is_confident_cbc(order_baseline, scores_this, order_this,
+                     K_overlap=20,
+                     cbc: "RunningPercentiles" = None,
+                     overlap_floor=0.30, margin_floor=0.01):
+    """CBC 기반 앵커 채택 함수"""
+    # Overlap 계산 (분모 고정)
+    top_b = set(order_baseline[:K_overlap])
+    top_t = set(order_this[:K_overlap])
+    overlap = len(top_b & top_t) / max(K_overlap, 1)  # ← 분모 고정
+
+    # Margin 계산
+    if len(order_this) >= 2:
+        s1 = scores_this[order_this[0]]
+        s2 = scores_this[order_this[1]]
+        margin = float(s1 - s2)
+    else:
+        margin = 0.0
+
+    # CBC 임계 도출 (없으면 폴백)
+    if cbc is not None:
+        thr_overlap = max(cbc.overlap_threshold(p=80, fallback=0.6), overlap_floor)
+        thr_margin  = max(cbc.margin_threshold(p=70,  fallback=0.03), margin_floor)
+    else:
+        thr_overlap, thr_margin = 0.6, 0.03
+
+    accept = (overlap >= thr_overlap) or (margin >= thr_margin)
+
+    # 통계 업데이트 (관측만)
+    if cbc is not None:
+        cbc.update(overlap, margin)
+
+    return accept, {"overlap": overlap, "margin": margin,
+                    "thr_overlap": thr_overlap, "thr_margin": thr_margin}
+
+# =========================
+# CBC (분포 기반 임계) 통계
+# =========================
+
+class RunningPercentiles:
+    def __init__(self, maxlen: int = 200):
+        from collections import deque
+        self.maxlen = maxlen
+        self.overlaps = deque(maxlen=maxlen)  # Overlap 기록
+        self.margins  = deque(maxlen=maxlen)  # Margin 기록
+
+    def update(self, overlap: float, margin: float):
+        self.overlaps.append(float(overlap))
+        self.margins.append(float(margin))
+
+    def perc(self, arr, p: float, fallback: float):
+        import numpy as np
+        if len(arr) == 0:
+            return fallback
+        return float(np.percentile(np.array(arr, dtype=np.float32), p))
+
+    def overlap_threshold(self, p=75, fallback=0.6):
+        return self.perc(self.overlaps, p, fallback)
+
+    def margin_threshold(self, p=60, fallback=0.03):
+        return self.perc(self.margins, p, fallback)
+
 # =========================
 # 캐시 관리
 # =========================
 
 def get_cache_file_path(cache_dir: str) -> str:
-    return os.path.join(cache_dir, "anchors_cache.json")
+    return os.path.join(cache_dir, "ollama_cache.json")
 
 def load_cache(query: str, cache_dir: str) -> Optional[List[str]]:
     cache_path = get_cache_file_path(cache_dir)
@@ -118,6 +179,7 @@ def build_label_index(labels: List[int]) -> Dict[int, List[int]]:
     return idx
 
 def create_filtering_candidates(corpus_texts, corpus_labels, label_idx, query_label, n_negative=99):
+    """기존 랜덤 방식 (호환성 유지)"""
     rng = np.random.default_rng(42)
     positives = label_idx[query_label]
     positive_doc = int(rng.choice(positives))
@@ -128,6 +190,126 @@ def create_filtering_candidates(corpus_texts, corpus_labels, label_idx, query_la
     
     candidate_pool = [positive_doc] + negative_docs.tolist()
     return candidate_pool, positive_doc, negative_docs.tolist()
+
+def build_hard_candidate_pool(
+    qid: str,
+    q_text: str,
+    relevant_set: set,
+    doc_embs: np.ndarray,
+    sbert: SentenceTransformer,
+    bm25_top: List[int] = None,
+    sbert_top_k: int = 200,
+    keep_pos_all: bool = True,
+) -> Tuple[List[int], List[int], List[int]]:
+    """
+    어려운 네거티브를 포함한 후보 풀 생성
+    반환: candidate_pool, positive_docs_in_pool, negative_docs_in_pool
+    """
+    # 1) SBERT 상위 K 랭크
+    q_emb = embed_texts(sbert, [q_text], 1)[0]
+    sims = doc_embs @ q_emb
+    sbert_top = np.argsort(sims)[::-1][:sbert_top_k].tolist()
+    
+    # 2) (선택) BM25 상위 K와 합치기 (harder)
+    if bm25_top is not None:
+        candidate_pool = list(dict.fromkeys(bm25_top + sbert_top))  # 중복 제거하며 순서 유지
+    else:
+        candidate_pool = sbert_top
+    
+    # 3) 후보 풀 내 정답/오답 분리
+    positives = [d for d in candidate_pool if d in relevant_set]
+    negatives = [d for d in candidate_pool if d not in relevant_set]
+    
+    # 안전장치: 정답이 하나도 안 들어오면 상위K를 늘리거나 BM25와 합집합 폭을 키우기
+    if len(positives) == 0:
+        # fallback 전략: sbert_top_k를 일시적으로 늘린다든지, bm25_top_k↑ 등
+        print(f"[Warning] No positives found for query {qid}, expanding search...")
+        expanded_top = np.argsort(sims)[::-1][:sbert_top_k * 2].tolist()
+        candidate_pool = expanded_top
+        positives = [d for d in candidate_pool if d in relevant_set]
+        negatives = [d for d in candidate_pool if d not in relevant_set]
+    
+    return candidate_pool, positives, negatives
+
+def compute_cbc_thresholds(scores: np.ndarray, percentile: float = 20.0) -> float:
+    """CBC 기반 동적 임계값 계산"""
+    if len(scores) == 0:
+        return 0.0
+    valid_scores = scores[scores != np.inf]
+    if len(valid_scores) == 0:
+        return 0.0
+    return float(np.percentile(valid_scores, percentile))
+
+def compute_filtering_metrics_cbc(
+    sbert_scores, anchor_scores, ce_scores,
+    candidate_pool, positive_docs, negative_docs,
+    cbc_stats: "RunningPercentiles" = None,
+    sbert_percentile: float = 20.0,
+    anchor_percentile: float = 20.0, 
+    ce_percentile: float = 95.0
+):
+    """CBC 기반 필터링 지표 계산"""
+    drop_decisions = []
+    keep_decisions = []
+    
+    # CBC 기반 임계값 계산
+    sbert_threshold = compute_cbc_thresholds(sbert_scores, sbert_percentile)
+    anchor_threshold = compute_cbc_thresholds(anchor_scores, anchor_percentile)
+    ce_threshold = compute_cbc_thresholds(ce_scores, ce_percentile)
+    
+    for i, doc_id in enumerate(candidate_pool):
+        sbert_score = sbert_scores[i]
+        anchor_score = anchor_scores[i]
+        ce_score = ce_scores[i]
+        
+        # 각 점수가 유효한 경우에만 해당 임계값을 적용
+        sbert_valid = sbert_score != np.inf and sbert_score != -np.inf
+        anchor_valid = anchor_score != np.inf and anchor_score != -np.inf
+        ce_valid = ce_score != np.inf and ce_score != -np.inf
+        
+        # OR 규칙: 하나라도 임계값 미만이면 드롭 후보
+        drop_conditions = []
+        if sbert_valid:
+            drop_conditions.append(sbert_score < sbert_threshold)
+        if ce_valid:
+            drop_conditions.append(ce_score < ce_threshold)
+        
+        # 드롭 후보 결정 (SBERT 또는 CE가 임계값 미만)
+        is_drop_candidate = len(drop_conditions) > 0 and any(drop_conditions)
+        
+        # 앵커 구제: 드롭 후보이지만 앵커가 임계값 이상이면 유지
+        if is_drop_candidate and anchor_valid and anchor_score >= anchor_threshold:
+            should_drop = False  # 앵커 구제
+        else:
+            should_drop = is_drop_candidate
+        
+        if should_drop:
+            drop_decisions.append(doc_id)
+        else:
+            keep_decisions.append(doc_id)
+    
+    # 지표 계산
+    dropped_positives = [d for d in drop_decisions if d in positive_docs]
+    dropped_negatives = [d for d in drop_decisions if d in negative_docs]
+    
+    total_positives = len(positive_docs)
+    total_negatives = len(negative_docs)
+    
+    drop_precision = len(dropped_negatives) / len(drop_decisions) if drop_decisions else 0.0
+    drop_recall = len(dropped_negatives) / total_negatives if total_negatives > 0 else 0.0
+    drop_f1 = 2 * drop_precision * drop_recall / (drop_precision + drop_recall) if (drop_precision + drop_recall) > 0 else 0.0
+    
+    return {
+        'Dropped_Count': len(drop_decisions),
+        'Dropped_Positive_Count': len(dropped_positives),
+        'Dropped_Negative_Count': len(dropped_negatives),
+        'Drop_Precision': drop_precision,
+        'Drop_Recall': drop_recall,
+        'Drop_F1': drop_f1,
+        'sbert_threshold': sbert_threshold,
+        'anchor_threshold': anchor_threshold,
+        'ce_threshold': ce_threshold
+    }
 
 # =========================
 # Ollama 앵커 생성
@@ -145,10 +327,10 @@ def generate_anchors_ollama(q: str, num_anchors: int, ollama_host: str,
 
     url = f"http://{ollama_host}:{ollama_port}/api/generate"
     prompt = (
-        f"Generate {num_anchors} short, distinct rephrasings of the query below. "
-        f"Each anchor must express the same intent as the query in slightly different words. "
-        f"No numbering, no extra text. One anchor per line.\n\n"
-        f"Query: {q}\n"
+        f"Generate {num_anchors} simple questions that mean the same as: {q}\n"
+        f"Use everyday words. Make them short and clear. "
+        f"Examples: 'How much do I pay each month?' or 'What's the best way to save money?' "
+        f"Just write the questions, one per line. No explanations, no numbers, no extra text.\n"
     )
     payload = {"model": ollama_model, "prompt": prompt, "stream": False}
 
@@ -292,9 +474,22 @@ def compute_filtering_metrics(sbert_scores, anchor_scores, ce_scores,
         anchor_score = anchor_scores[i]
         ce_score = ce_scores[i]
         
-        should_drop = (sbert_score < thresholds["sbert"] and 
-                      anchor_score < thresholds["anchor"] and 
-                      ce_score < thresholds["ce"])
+        # 각 점수가 유효한 경우에만 해당 임계값을 적용
+        sbert_valid = sbert_score != np.inf and sbert_score != -np.inf
+        anchor_valid = anchor_score != np.inf and anchor_score != -np.inf
+        ce_valid = ce_score != np.inf and ce_score != -np.inf
+        
+        # 유효한 점수들만으로 필터링 결정
+        drop_conditions = []
+        if sbert_valid:
+            drop_conditions.append(sbert_score < thresholds["sbert"])
+        if anchor_valid:
+            drop_conditions.append(anchor_score < thresholds["anchor"])
+        if ce_valid:
+            drop_conditions.append(ce_score < thresholds["ce"])
+        
+        # 최소 하나의 조건이 있으면 모든 조건을 만족해야 드롭
+        should_drop = len(drop_conditions) > 0 and all(drop_conditions)
         
         if should_drop:
             drop_decisions.append(doc_id)
@@ -305,6 +500,8 @@ def compute_filtering_metrics(sbert_scores, anchor_scores, ce_scores,
     dropped_negative = len(set(drop_decisions) & set(negative_docs))
     drop_precision = dropped_negative / len(drop_decisions) if drop_decisions else 0.0
     drop_recall = dropped_negative / total_negative if total_negative > 0 else 0.0
+    drop_f1 = 2 * drop_precision * drop_recall / (drop_precision + drop_recall) if (drop_precision + drop_recall) > 0 else 0.0
+    
     positive_kept = positive_doc in keep_decisions
     keep_recall = 1.0 if positive_kept else 0.0
     
@@ -316,6 +513,7 @@ def compute_filtering_metrics(sbert_scores, anchor_scores, ce_scores,
     return {
         "Drop_Precision": drop_precision,
         "Drop_Recall": drop_recall,
+        "Drop_F1": drop_f1,
         "Keep_Recall": keep_recall,
         "Keep_Recall_Any": keep_any,
         "Coverage": coverage,

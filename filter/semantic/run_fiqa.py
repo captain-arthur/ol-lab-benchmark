@@ -31,7 +31,7 @@ from s_filter import (
 # Configuration
 # -----------------------------
 EXPERIMENT_CONFIG = {
-    "max_queries": 20,
+    "max_queries": 200,
     "split": "test",
     "out_dir": "results/semantic/fiqa"
 }
@@ -687,18 +687,8 @@ def run_sbert_ce_llm_cbc(sbert, doc_embs, ce, corpus_texts, corpus_labels, query
         else:
             sbert_scores = q_scores
         
-        # CrossEncoder 점수 계산
-        ce_scores = np.full(len(candidate_pool), np.inf, dtype=np.float32)
-        dropped_docs = []
-        for j, doc_id in enumerate(candidate_pool):
-            if sbert_scores[j] < 0.3:
-                dropped_docs.append(doc_id)
-        
-        if dropped_docs:
-            dropped_ce_scores = ce_score_pairs_cached(ce, i, q, dropped_docs, corpus_texts, ce_cache)
-            for k, doc_id in enumerate(dropped_docs):
-                doc_idx = candidate_pool.index(doc_id)
-                ce_scores[doc_idx] = dropped_ce_scores[k]
+        # CrossEncoder 점수 계산 (후보풀 전체)
+        ce_scores = ce_score_pairs_cached(ce, i, q, candidate_pool, corpus_texts, ce_cache)
         
         # LLM 앵커 점수 계산 (개선: 모든 문서에 대해 앵커 점수 계산)
         anchor_scores = np.full(len(candidate_pool), np.inf, dtype=np.float32)
@@ -724,10 +714,10 @@ def run_sbert_ce_llm_cbc(sbert, doc_embs, ce, corpus_texts, corpus_labels, query
         ce_scores_norm = ce_sigmoid_temp(ce_scores, T=2.0)
         anchor_scores_norm = norm_cosine_per_query(anchor_scores)
         
-        # CBC 기반 임계값 (원래 적응적 퍼센타일 사용)
-        sbert_threshold = compute_cbc_thresholds(sbert_scores_norm, percentile=adaptive_percentiles['sbert'], floor=0.20)
-        ce_threshold = compute_cbc_thresholds(ce_scores_norm, percentile=adaptive_percentiles['ce'], floor=0.30)
-        anchor_threshold = compute_cbc_thresholds(anchor_scores_norm, percentile=adaptive_percentiles['anchor'], floor=0.20)
+        # CBC 기반 임계값 (금융 도메인에 맞는 적극적 필터링)
+        sbert_threshold = compute_cbc_thresholds(sbert_scores_norm, percentile=adaptive_percentiles['sbert'], floor=0.05)
+        ce_threshold = compute_cbc_thresholds(ce_scores_norm, percentile=adaptive_percentiles['ce'], floor=0.10)
+        anchor_threshold = compute_cbc_thresholds(anchor_scores_norm, percentile=adaptive_percentiles['anchor'], floor=0.05)
         
         print(f"[CBC] 정규화 후 임계값: SBERT {sbert_threshold:.3f}, CE {ce_threshold:.3f}, 앵커 {anchor_threshold:.3f}")
         
@@ -782,13 +772,25 @@ def ce_sigmoid_temp(z: np.ndarray, T: float = 2.0) -> np.ndarray:
     return out
 
 def norm_cosine_per_query(scores):
-    """코사인 유사도 per-query 정규화"""
+    """코사인 유사도 per-query 정규화 (금융 도메인 맞춤)"""
     s = scores[np.isfinite(scores)]
     if len(s) == 0: 
         return scores
     lo, hi = float(s.min()), float(s.max())
     if hi - lo < 1e-6: 
-        return np.ones_like(scores, dtype=np.float32) * 0.5
+        # 모든 점수가 동일할 때: 상위 50%는 0.6~1.0, 하위 50%는 0.0~0.4로 분산
+        n = len(s)
+        out = np.ones_like(scores, dtype=np.float32) * 0.5
+        if n > 1:
+            # 상위 절반은 0.6~1.0, 하위 절반은 0.0~0.4
+            sorted_indices = np.argsort(scores)
+            for i, idx in enumerate(sorted_indices):
+                if i < n // 2:  # 하위 절반
+                    out[idx] = 0.0 + (i / (n // 2)) * 0.4
+                else:  # 상위 절반
+                    out[idx] = 0.6 + ((i - n // 2) / (n - n // 2)) * 0.4
+        out[~np.isfinite(scores)] = np.inf
+        return out
     out = (scores - lo) / (hi - lo)
     out[~np.isfinite(scores)] = np.inf
     return out

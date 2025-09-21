@@ -249,6 +249,8 @@ def compute_filtering_metrics_cbc(
     ce_percentile: float = 95.0
 ):
     """CBC 기반 필터링 지표 계산"""
+    print(f"[CBC] using percentiles: sbert={sbert_percentile}, ce={ce_percentile}, anchor={anchor_percentile}")
+    
     drop_decisions = []
     keep_decisions = []
     
@@ -256,6 +258,23 @@ def compute_filtering_metrics_cbc(
     sbert_threshold = compute_cbc_thresholds(sbert_scores, sbert_percentile)
     anchor_threshold = compute_cbc_thresholds(anchor_scores, anchor_percentile)
     ce_threshold = compute_cbc_thresholds(ce_scores, ce_percentile)
+    
+    print(f"[CBC] thresholds: s={sbert_threshold:.3f}, ce={ce_threshold:.3f}, a={anchor_threshold:.3f}")
+    
+    # 드롭 후보 통계
+    drop_candidates = ((sbert_scores < sbert_threshold) | (ce_scores < ce_threshold)) & np.isfinite(sbert_scores)
+    print(f"[CBC] stats: drop_cand={sum(drop_candidates)}, total={len(candidate_pool)}")
+    
+    # 점수 분포 디버깅
+    sbert_finite = sbert_scores[np.isfinite(sbert_scores)]
+    ce_finite = ce_scores[np.isfinite(ce_scores)]
+    print(f"[CBC] score ranges: SBERT[{sbert_finite.min():.3f}, {sbert_finite.max():.3f}], CE[{ce_finite.min():.3f}, {ce_finite.max():.3f}]")
+    print(f"[CBC] thresholds: SBERT<{sbert_threshold:.3f}, CE<{ce_threshold:.3f}")
+    
+    # 개별 조건 확인
+    sbert_drops = np.sum((sbert_scores < sbert_threshold) & np.isfinite(sbert_scores))
+    ce_drops = np.sum((ce_scores < ce_threshold) & np.isfinite(ce_scores))
+    print(f"[CBC] individual drops: SBERT={sbert_drops}, CE={ce_drops}")
     
     for i, doc_id in enumerate(candidate_pool):
         sbert_score = sbert_scores[i]
@@ -274,8 +293,8 @@ def compute_filtering_metrics_cbc(
         if ce_valid:
             drop_conditions.append(ce_score < ce_threshold)
         
-        # 드롭 후보 결정 (SBERT 또는 CE가 임계값 미만)
-        is_drop_candidate = len(drop_conditions) > 0 and any(drop_conditions)
+        # 드롭 후보 결정 (유효한 조건 중 하나라도 임계값 미만)
+        is_drop_candidate = any(drop_conditions) if drop_conditions else False
         
         # 앵커 구제: 드롭 후보이지만 앵커가 임계값 이상이면 유지
         if is_drop_candidate and anchor_valid and anchor_score >= anchor_threshold:

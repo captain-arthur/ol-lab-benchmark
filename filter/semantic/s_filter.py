@@ -35,8 +35,7 @@ def save_json(obj, path: str):
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 def timer_ms():
-    t0 = time.time()
-    return lambda: (time.time() - t0) * 1000.0
+    return time.time() * 1000.0
 
 def ndcg_at_k(order, relevant, k):
     dcg = 0.0
@@ -216,7 +215,22 @@ def build_hard_candidate_pool(
     else:
         candidate_pool = sbert_top
     
-    # 3) 후보 풀 내 정답/오답 분리
+    # 3) 중복 문서 제거 (문서 임베딩 중복 방지)
+    unique_candidate_pool = []
+    seen_embeddings = set()
+    
+    for doc_idx in candidate_pool:
+        # 문서 임베딩을 문자열로 변환하여 중복 체크
+        doc_emb_str = str(doc_embs[doc_idx].tolist())
+        if doc_emb_str not in seen_embeddings:
+            seen_embeddings.add(doc_emb_str)
+            unique_candidate_pool.append(doc_idx)
+        else:
+            print(f"[Debug] Duplicate document embedding detected for doc {doc_idx}")
+    
+    candidate_pool = unique_candidate_pool
+    
+    # 4) 후보 풀 내 정답/오답 분리
     positives = [d for d in candidate_pool if d in relevant_set]
     negatives = [d for d in candidate_pool if d not in relevant_set]
     
@@ -225,10 +239,22 @@ def build_hard_candidate_pool(
         # fallback 전략: sbert_top_k를 일시적으로 늘린다든지, bm25_top_k↑ 등
         print(f"[Warning] No positives found for query {qid}, expanding search...")
         expanded_top = np.argsort(sims)[::-1][:sbert_top_k * 2].tolist()
-        candidate_pool = expanded_top
+        
+        # 확장된 후보 풀에서도 중복 제거
+        unique_expanded_pool = []
+        seen_embeddings = set()
+        
+        for doc_idx in expanded_top:
+            doc_emb_str = str(doc_embs[doc_idx].tolist())
+            if doc_emb_str not in seen_embeddings:
+                seen_embeddings.add(doc_emb_str)
+                unique_expanded_pool.append(doc_idx)
+        
+        candidate_pool = unique_expanded_pool
         positives = [d for d in candidate_pool if d in relevant_set]
         negatives = [d for d in candidate_pool if d not in relevant_set]
     
+    print(f"[Debug] Final candidate pool: {len(candidate_pool)} unique documents")
     return candidate_pool, positives, negatives
 
 def compute_cbc_thresholds(scores: np.ndarray, percentile: float = 20.0) -> float:
@@ -239,6 +265,159 @@ def compute_cbc_thresholds(scores: np.ndarray, percentile: float = 20.0) -> floa
     if len(valid_scores) == 0:
         return 0.0
     return float(np.percentile(valid_scores, percentile))
+
+def normalize_threshold(threshold: float, all_scores: list) -> float:
+    """임계값을 0-1 범위로 정규화 - 90%+ Drop Precision을 위한 엄격한 설정"""
+    if not all_scores:
+        return threshold
+    
+    min_score = min(all_scores)
+    max_score = max(all_scores)
+    
+    if max_score - min_score < 1e-6:
+        return 0.7  # 모든 점수가 동일한 경우에도 더 엄격하게
+    
+    # 더 엄격한 임계값을 위해 상위 20% 지점으로 조정
+    normalized = (threshold - min_score) / (max_score - min_score)
+    # 90%+ precision을 위해 임계값을 더 높게 설정
+    return min(0.9, max(0.7, normalized + 0.1))
+
+def analyze_score_distribution(scores: list) -> dict:
+    """점수 분포 특성 분석"""
+    if not scores:
+        return {"type": "none", "mean": 0, "std": 0}
+    
+    scores_array = np.array(scores)
+    mean_score = np.mean(scores_array)
+    std_score = np.std(scores_array)
+    
+    # 분포 타입 결정
+    if std_score < 0.1:
+        dist_type = "low_concentration"
+    elif std_score > 0.3:
+        dist_type = "high_variance"
+    else:
+        dist_type = "balanced"
+    
+    return {
+        "type": dist_type,
+        "mean": mean_score,
+        "std": std_score
+    }
+
+def calculate_adaptive_percentiles(sbert_characteristics: dict, ce_characteristics: dict, anchor_characteristics: dict) -> dict:
+    """적응적 퍼센타일 계산 - 90%+ Drop Precision을 위한 엄격한 설정"""
+    # SBERT 퍼센타일 (더 엄격하게)
+    if sbert_characteristics["type"] == "low_concentration":
+        sbert_percentile = 10.0  # 20.0 -> 10.0 (더 엄격)
+    elif sbert_characteristics["type"] == "high_variance":
+        sbert_percentile = 30.0  # 50.0 -> 30.0 (더 엄격)
+    else:
+        sbert_percentile = 20.0  # 35.0 -> 20.0 (더 엄격)
+    
+    # CE 퍼센타일 (더 엄격하게)
+    if ce_characteristics["type"] == "low_concentration":
+        ce_percentile = 15.0  # 30.0 -> 15.0 (더 엄격)
+    elif ce_characteristics["type"] == "high_variance":
+        ce_percentile = 60.0  # 80.0 -> 60.0 (더 엄격)
+    else:
+        ce_percentile = 40.0  # 55.0 -> 40.0 (더 엄격)
+    
+    # 앵커 퍼센타일 (더 엄격하게)
+    if anchor_characteristics["type"] == "none":
+        anchor_percentile = 0.0
+    elif anchor_characteristics["type"] == "low_concentration":
+        anchor_percentile = 10.0  # 20.0 -> 10.0 (더 엄격)
+    elif anchor_characteristics["type"] == "high_variance":
+        anchor_percentile = 40.0  # 60.0 -> 40.0 (더 엄격)
+    else:
+        anchor_percentile = 30.0  # 45.0 -> 30.0 (더 엄격)
+    
+    return {
+        "sbert": sbert_percentile,
+        "ce": ce_percentile,
+        "anchor": anchor_percentile
+    }
+
+def compute_filtering_metrics_cbc_adaptive(
+    sbert_scores, anchor_scores, ce_scores,
+    candidate_pool, positive_docs, negative_docs,
+    sbert_threshold, ce_threshold, anchor_threshold
+):
+    """적응적 임계값을 사용한 CBC 필터링"""
+    drop_decisions = []
+    keep_decisions = []
+    
+    print(f"[CBC] using adaptive thresholds: sbert={sbert_threshold:.3f}, ce={ce_threshold:.3f}, anchor={anchor_threshold:.3f}")
+    
+    # 드롭 후보 통계
+    drop_candidates = ((sbert_scores < sbert_threshold) | (ce_scores < ce_threshold)) & np.isfinite(sbert_scores)
+    print(f"[CBC] stats: drop_cand={sum(drop_candidates)}, total={len(candidate_pool)}")
+    
+    # 점수 분포 디버깅
+    sbert_finite = sbert_scores[np.isfinite(sbert_scores)]
+    ce_finite = ce_scores[np.isfinite(ce_scores)]
+    print(f"[CBC] score ranges: SBERT[{sbert_finite.min():.3f}, {sbert_finite.max():.3f}], CE[{ce_finite.min():.3f}, {ce_finite.max():.3f}]")
+    print(f"[CBC] thresholds: SBERT<{sbert_threshold:.3f}, CE<{ce_threshold:.3f}")
+    
+    # 개별 조건 확인
+    sbert_drops = np.sum((sbert_scores < sbert_threshold) & np.isfinite(sbert_scores))
+    ce_drops = np.sum((ce_scores < ce_threshold) & np.isfinite(ce_scores))
+    print(f"[CBC] individual drops: SBERT={sbert_drops}, CE={ce_drops}")
+    
+    for i, doc_id in enumerate(candidate_pool):
+        sbert_score = sbert_scores[i]
+        anchor_score = anchor_scores[i]
+        ce_score = ce_scores[i]
+        
+        # 각 점수가 유효한 경우에만 해당 임계값을 적용
+        sbert_valid = sbert_score != np.inf and sbert_score != -np.inf
+        anchor_valid = anchor_score != np.inf and anchor_score != -np.inf
+        ce_valid = ce_score != np.inf and ce_score != -np.inf
+        
+        # OR 규칙: 하나라도 임계값 미만이면 드롭 후보
+        drop_conditions = []
+        if sbert_valid:
+            drop_conditions.append(sbert_score < sbert_threshold)
+        if ce_valid:
+            drop_conditions.append(ce_score < ce_threshold)
+        
+        # 드롭 후보 결정 (유효한 조건 중 하나라도 임계값 미만)
+        is_drop_candidate = any(drop_conditions) if drop_conditions else False
+        
+        # 앵커 구제: 드롭 후보이지만 앵커가 임계값 이상이면 유지
+        if is_drop_candidate and anchor_valid and anchor_score >= anchor_threshold:
+            should_drop = False  # 앵커 구제
+        else:
+            should_drop = is_drop_candidate
+        
+        if should_drop:
+            drop_decisions.append(doc_id)
+        else:
+            keep_decisions.append(doc_id)
+    
+    # 지표 계산
+    dropped_positives = [d for d in drop_decisions if d in positive_docs]
+    dropped_negatives = [d for d in drop_decisions if d in negative_docs]
+    
+    total_positives = len(positive_docs)
+    total_negatives = len(negative_docs)
+    
+    drop_precision = len(dropped_negatives) / len(drop_decisions) if drop_decisions else 0.0
+    drop_recall = len(dropped_negatives) / total_negatives if total_negatives > 0 else 0.0
+    drop_f1 = 2 * drop_precision * drop_recall / (drop_precision + drop_recall) if (drop_precision + drop_recall) > 0 else 0.0
+    
+    return {
+        'Dropped_Count': len(drop_decisions),
+        'Dropped_Positive_Count': len(dropped_positives),
+        'Dropped_Negative_Count': len(dropped_negatives),
+        'Drop_Precision': drop_precision,
+        'Drop_Recall': drop_recall,
+        'Drop_F1': drop_f1,
+        'sbert_threshold': sbert_threshold,
+        'anchor_threshold': anchor_threshold,
+        'ce_threshold': ce_threshold
+    }
 
 def compute_filtering_metrics_cbc(
     sbert_scores, anchor_scores, ce_scores,

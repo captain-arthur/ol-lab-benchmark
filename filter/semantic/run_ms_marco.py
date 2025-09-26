@@ -24,7 +24,8 @@ from s_filter import (
     generate_anchors_ollama, embed_texts, rank_biencoder, rank_with_anchors,
     ce_score_pairs_cached, calibrate_ce_threshold, rerank_crossencoder,
     compute_metrics, aggregate_metrics, compute_filtering_metrics, RunningPercentiles,
-    build_hard_candidate_pool, compute_filtering_metrics_cbc
+    build_hard_candidate_pool, compute_filtering_metrics_cbc, normalize_threshold,
+    analyze_score_distribution, calculate_adaptive_percentiles, compute_filtering_metrics_cbc_adaptive
 )
 
 # -----------------------------

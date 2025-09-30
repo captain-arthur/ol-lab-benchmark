@@ -22,6 +22,19 @@ import re
 from collections import Counter, defaultdict
 from typing import List, Dict, Any, Optional, Tuple
 
+# ===== Output: force line-buffered + optional tqdm =====
+try:
+    import sys
+    # Python 3.7+ 에서 라인 단위로 바로바로 flush
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
+
 # ===============================
 # Optional imports (graceful)
 # ===============================
@@ -74,17 +87,19 @@ class LLMFilterConfig:
         # 라우팅 임계값
         self.theta = kwargs.get("theta", 0.8)  # 높은 신뢰도 기준
         self.warmup_k = kwargs.get("warmup_k", 4)  # SetFit 학습용 최소 쿼리 수
-        self.update_every = kwargs.get("update_every", 5)
+        self.update_every = kwargs.get("update_every", 3)  # 5 → 3으로 감소
         
-        # SetFit 설정
+        # SetFit 설정 (속도 최적화)
         self.setfit_mode = kwargs.get("setfit_mode", "both")
-        self.mc_passes = kwargs.get("mc_passes", 10)
+        self.mc_passes = kwargs.get("mc_passes", 5)  # 10 → 5로 감소
         self.dropout_p = kwargs.get("dropout_p", 0.2)
+        self.setfit_epochs = kwargs.get("setfit_epochs", 1)  # 3 → 1로 감소
+        self.setfit_batch_size = kwargs.get("setfit_batch_size", 4)  # 8 → 4로 감소
         
         # Ollama 설정
-        self.ollama_url = kwargs.get("ollama_url", "http://192.168.45.166:11434")
+        self.ollama_url = kwargs.get("ollama_url", "http://127.0.0.1:11434")
         self.gemma_lite = kwargs.get("gemma_lite", "gemma:2b")
-        self.gemma_heavy = kwargs.get("gemma_heavy", "gemma3")
+        self.gemma_heavy = kwargs.get("gemma_heavy", "gemma3:latest")
         self.temperature = kwargs.get("temperature", 0.0)
         self.top_p = kwargs.get("top_p", 1.0)
         
@@ -653,7 +668,7 @@ class SetFitHelper:
                 return
                 
             ds = Dataset.from_dict({"text": self.bufX, "label": y})
-            args = self._args_safe(epochs=1, batch_size=min(16, len(self.bufX)), num_iterations=5)
+            args = self._args_safe(epochs=1, batch_size=min(4, len(self.bufX)), num_iterations=3)
             trainer = SetFitTrainer(model=self.model, args=args, train_dataset=ds, column_mapping={"text":"text","label":"label"})
             trainer.train()
             print(f"[SetFit] Online mini-fit ({len(self.bufX)} samples)")
@@ -1067,8 +1082,8 @@ def load_fiqa_data(max_queries: int = 648) -> List[Dict[str, Any]]:
         return []
 
 def create_llm_filtering_prompt(query: str, passages: List[str]) -> str:
-    """LLM 필터링을 위한 프롬프트 생성"""
-    return f"""You are an expert information retrieval system. Your task is to filter and rank documents based on their relevance to the given query.
+    """LLM 필터링을 위한 프롬프트 생성 (Decision + Confidence 형식)"""
+    return f"""You are an expert information retrieval system. Your task is to filter documents based on their relevance to the given query.
 
 Query: {query}
 
@@ -1076,68 +1091,97 @@ Documents to evaluate:
 {chr(10).join([f"{i+1}. {passage}" for i, passage in enumerate(passages)])}
 
 Instructions:
-1. Analyze each document's relevance to the query
-2. For each document, provide a relevance score from 0.0 to 1.0
-3. 1.0 = highly relevant, 0.0 = completely irrelevant
-4. Consider semantic similarity, topic alignment, and information quality
-5. Be precise and consistent in your scoring
+1. For each document, decide whether to KEEP or DROP it
+2. Provide your confidence level (0.0-1.0) for this decision
+3. KEEP = relevant to the query, DROP = not relevant
+4. Confidence = how certain you are about your decision
+5. Be precise and consistent
 
 Format your response as:
-Document 1: [score]
-Document 2: [score]
+Document 1: KEEP, 0.85
+Document 2: DROP, 0.23
+Document 3: KEEP, 0.92
 ...
-Document {len(passages)}: [score]
+Document {len(passages)}: [DECISION], [CONFIDENCE]
 
 Scores:"""
 
-def parse_llm_scores(response: str, num_docs: int) -> List[float]:
-    """LLM 응답에서 점수 파싱"""
-    scores = []
+def parse_llm_decisions(response: str, num_docs: int) -> List[Dict[str, Any]]:
+    """LLM 응답에서 decision + confidence 파싱"""
+    decisions = []
     lines = response.strip().split('\n')
     
     for i in range(num_docs):
-        score = 0.5  # 기본값
+        decision = "DROP"  # 기본값
+        confidence = 0.5   # 기본값
+        
         for line in lines:
-            # 다양한 형식 지원: "Document 1:", "문서 1:", "1. ...", "문서1:"
-            if (f"Document {i+1}:" in line or f"문서 {i+1}:" in line or 
-                f"{i+1}. " in line or f"문서{i+1}:" in line):
-                # 숫자 추출 (점수 부분만)
+            # Document N: 형식 찾기
+            if f"Document {i+1}:" in line:
                 import re
-                # 콜론(:) 뒤의 숫자 찾기
-                if ':' in line:
-                    score_part = line.split(':', 1)[1]
-                else:
-                    score_part = line
+                # KEEP/DROP 추출
+                if "KEEP" in line.upper():
+                    decision = "KEEP"
+                elif "DROP" in line.upper():
+                    decision = "DROP"
                 
-                # 0.0~1.0 형식의 숫자 찾기 (더 정확한 패턴)
-                score_match = re.search(r'[01]\.\d+', score_part)
-                if score_match:
+                # Confidence 추출 (0.0-1.0)
+                confidence_match = re.search(r'[01]\.\d+', line)
+                if confidence_match:
                     try:
-                        score = float(score_match.group())
-                        score = max(0.0, min(1.0, score))  # 0-1 범위로 클리핑
+                        confidence = float(confidence_match.group())
+                        confidence = max(0.0, min(1.0, confidence))
                     except:
-                        score = 0.5
-                else:
-                    # 정수 찾기 (1~10을 0.1~1.0으로 변환)
-                    int_match = re.search(r'\b([1-9]|10)\b', score_part)
-                    if int_match:
-                        try:
-                            score = float(int_match.group()) / 10.0
-                            score = max(0.0, min(1.0, score))
-                        except:
-                            score = 0.5
+                        confidence = 0.5
                 break
-        scores.append(score)
+        
+        decisions.append({
+            'decision': decision,
+            'confidence': confidence
+        })
     
-    return scores
+    return decisions
+
+def parse_llm_scores(response: str, num_docs: int) -> List[float]:
+    """기존 호환성을 위한 함수 (deprecated)"""
+    decisions = parse_llm_decisions(response, num_docs)
+    return [d['confidence'] for d in decisions]
 
 def calculate_f1_metrics(predictions: List[float], ground_truth: List[int], threshold: float = 0.5) -> Dict[str, float]:
-    """F1 점수 중심의 평가 지표 계산"""
-    if len(predictions) != len(ground_truth):
+    """기존 호환성을 위한 함수 (deprecated)"""
+    # predictions를 decisions 형식으로 변환
+    decisions = [{'decision': 'KEEP' if p >= threshold else 'DROP', 'confidence': p} for p in predictions]
+    return calculate_f1_metrics_from_decisions(decisions, ground_truth, threshold)
+
+def simple_cbc_routing(decision: str, confidence: float, stage_scores: List[float], absolute_threshold: float = 0.8, percentile_threshold: int = 85) -> str:
+    """단순한 CBC 라우팅: 절대값 + 상대값 기준"""
+    import numpy as np
+    
+    # 1. 절대 기준: 확실히 높은 confidence
+    if confidence >= absolute_threshold:
+        return "stop"  # 확실함 - 여기서 종료
+    
+    # 2. 상대 기준: 현재 배치에서 상위 percentile_threshold% 이상
+    if len(stage_scores) > 0:
+        relative_threshold = np.percentile(stage_scores, percentile_threshold)
+        if confidence >= relative_threshold:
+            return "stop"  # 상대적으로 높음 - 여기서 종료
+    
+    return "continue"  # 애매함 - 다음 단계로 라우팅
+
+def calculate_f1_metrics_from_decisions(decisions: List[Dict[str, Any]], ground_truth: List[int], confidence_threshold: float = 0.5) -> Dict[str, float]:
+    """Decision + Confidence에서 F1 점수 계산"""
+    if len(decisions) != len(ground_truth):
         return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
     
-    # 이진 분류로 변환
-    pred_binary = [1 if p >= threshold else 0 for p in predictions]
+    # Decision + Confidence를 이진 분류로 변환
+    pred_binary = []
+    for decision in decisions:
+        # KEEP이고 confidence가 임계값 이상이면 1, 아니면 0
+        if decision['decision'] == 'KEEP' and decision['confidence'] >= confidence_threshold:
+            pred_binary.append(1)
+        else:
+            pred_binary.append(0)
     
     # True Positive, False Positive, False Negative 계산
     tp = sum(1 for p, g in zip(pred_binary, ground_truth) if p == 1 and g == 1)
@@ -1160,7 +1204,7 @@ def calculate_f1_metrics(predictions: List[float], ground_truth: List[int], thre
 
 def run_llm_baseline_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
     """① Large-scale LLM Only (Baseline) 실험"""
-    print("🔄 Running LLM Baseline Experiment...")
+    print("\n" + "="*60 + "\n🚀 Starting LLM Baseline Experiment\n" + "="*60, flush=True)
     
     ollama = Ollama(config.ollama_url, config.temperature, config.top_p, config.seed)
     cache = ResponseCache(".cache/llm_baseline_cache.jsonl")
@@ -1168,22 +1212,24 @@ def run_llm_baseline_experiment(data: List[Dict[str, Any]], config: LLMFilterCon
     results = []
     start_time = time.time()
     total_queries = len(data)
+    pbar = tqdm(total=total_queries, desc="Baseline (Heavy-only)", dynamic_ncols=True) if tqdm else None
     
     for idx, item in enumerate(data):
-        print(f"📊 Baseline 진행: {idx+1}/{total_queries} 쿼리 처리 중...")
+        if pbar: pbar.update(1)
+        else: print(f"📊 Baseline 진행: {idx+1}/{total_queries} 쿼리 처리 중...", flush=True)
         query = item['query']
         passages = item['passages']
         
-        # LLM으로 필터링 수행
+        # LLM으로 필터링 수행 (Decision + Confidence 형식)
         prompt = create_llm_filtering_prompt(query, passages)
         response, usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-        scores = parse_llm_scores(response, len(passages))
+        decisions = parse_llm_decisions(response, len(passages))
         
         # 실제 MS MARCO Ground Truth 사용
         ground_truth = item['relevance_labels']
         
-        # 평가 지표 계산
-        metrics = calculate_f1_metrics(scores, ground_truth)
+        # 평가 지표 계산 (Decision + Confidence 기반)
+        metrics = calculate_f1_metrics_from_decisions(decisions, ground_truth)
         
         # Cost 및 Latency 계산
         cost = 3  # Heavy 모델만 사용
@@ -1192,7 +1238,7 @@ def run_llm_baseline_experiment(data: List[Dict[str, Any]], config: LLMFilterCon
         results.append({
             'query_id': item['query_id'],
             'query': query,
-            'scores': scores,
+            'decisions': decisions,  # Decision + Confidence 정보
             'ground_truth': ground_truth,
             'metrics': metrics,
             'model_used': 'heavy',  # Baseline은 항상 heavy 모델 사용
@@ -1202,6 +1248,7 @@ def run_llm_baseline_experiment(data: List[Dict[str, Any]], config: LLMFilterCon
         })
     
     end_time = time.time()
+    if pbar: pbar.close()
     
     # 전체 성능 계산
     all_precision = [r['metrics']['precision'] for r in results]
@@ -1226,6 +1273,7 @@ def run_llm_baseline_experiment(data: List[Dict[str, Any]], config: LLMFilterCon
     print(f"📊 Average F1: {overall_metrics['avg_f1']:.3f}")
     print(f"📊 Average Precision: {overall_metrics['avg_precision']:.3f}")
     print(f"📊 Average Recall: {overall_metrics['avg_recall']:.3f}")
+    print("\n" + "="*60 + "\n✅ Finished LLM Baseline Experiment\n" + "="*60, flush=True)
     
     return {
         'results': results,
@@ -1235,7 +1283,7 @@ def run_llm_baseline_experiment(data: List[Dict[str, Any]], config: LLMFilterCon
 
 def run_llm_lite_route_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
     """② Large-scale LLM + Lightweight LLM 실험"""
-    print("🔄 Running LLM Lite-Route Experiment...")
+    print("\n" + "="*60 + "\n🚀 Starting LLM Lite-Route Experiment\n" + "="*60, flush=True)
     
     ollama = Ollama(config.ollama_url, config.temperature, config.top_p, config.seed)
     cache = ResponseCache(".cache/llm_lite_route_cache.jsonl")
@@ -1243,24 +1291,31 @@ def run_llm_lite_route_experiment(data: List[Dict[str, Any]], config: LLMFilterC
     results = []
     start_time = time.time()
     total_queries = len(data)
+    pbar = tqdm(total=total_queries, desc="Lite Route", dynamic_ncols=True) if tqdm else None
     
     for idx, item in enumerate(data):
-        print(f"📊 Lite Route 진행: {idx+1}/{total_queries} 쿼리 처리 중...")
+        if pbar: pbar.update(1)
+        else: print(f"📊 Lite Route 진행: {idx+1}/{total_queries} 쿼리 처리 중...", flush=True)
         query = item['query']
         passages = item['passages']
         
         # 경량 LLM으로 먼저 시도
         prompt = create_llm_filtering_prompt(query, passages)
         lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
-        lite_scores = parse_llm_scores(lite_response, len(passages))
+        lite_decisions = parse_llm_decisions(lite_response, len(passages))
         
-        # 개선된 신뢰도 계산 (LLM 응답 기반)
-        confidence = extract_confidence_from_llm_response(lite_response, lite_scores)
+        # Lite LLM의 평균 confidence 계산
+        lite_confidences = [d['confidence'] for d in lite_decisions]
+        avg_confidence = sum(lite_confidences) / len(lite_confidences) if lite_confidences else 0.5
         
-        # 신뢰도가 낮으면 고성능 LLM으로 라우팅
-        if confidence < config.theta:
+        # CBC 라우팅: 절대값 + 상대값 기준으로 판단
+        routing_decision = simple_cbc_routing("KEEP", avg_confidence, lite_confidences)
+        
+        # 라우팅 결정에 따라 처리
+        if routing_decision == "continue":
+            # Lite LLM 신뢰도가 낮음 → Heavy LLM으로 라우팅
             heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-            final_scores = parse_llm_scores(heavy_response, len(passages))
+            final_decisions = parse_llm_decisions(heavy_response, len(passages))
             model_used = 'heavy'
             total_usage = {
                 'lite_tokens': lite_usage.get('total_tokens_est', 0),
@@ -1271,7 +1326,8 @@ def run_llm_lite_route_experiment(data: List[Dict[str, Any]], config: LLMFilterC
             cost = 2 + 3  # Lite(2) + Heavy(3)
             latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
         else:
-            final_scores = lite_scores
+            # Lite LLM에서 충분한 신뢰도 → 여기서 종료
+            final_decisions = lite_decisions
             model_used = 'lite'
             total_usage = lite_usage
             # Cost 및 Latency 계산 (Lite만)
@@ -1281,23 +1337,25 @@ def run_llm_lite_route_experiment(data: List[Dict[str, Any]], config: LLMFilterC
         # 실제 MS MARCO Ground Truth 사용
         ground_truth = item['relevance_labels']
         
-        # 평가 지표 계산
-        metrics = calculate_f1_metrics(final_scores, ground_truth)
+        # 평가 지표 계산 (Decision + Confidence 기반)
+        metrics = calculate_f1_metrics_from_decisions(final_decisions, ground_truth)
         
         results.append({
             'query_id': item['query_id'],
             'query': query,
-            'scores': final_scores,
+            'decisions': final_decisions,  # Decision + Confidence 정보
             'ground_truth': ground_truth,
             'metrics': metrics,
             'model_used': model_used,
-            'lite_confidence': confidence,  # 명확한 필드명 사용
+            'lite_confidence': avg_confidence,  # Lite LLM 평균 신뢰도
+            'routing_decision': routing_decision,  # 라우팅 결정
             'usage': total_usage,
             'cost_per_query': cost,
             'latency_s': latency
         })
     
     end_time = time.time()
+    if pbar: pbar.close()
     
     # 전체 성능 계산
     all_precision = [r['metrics']['precision'] for r in results]
@@ -1330,6 +1388,7 @@ def run_llm_lite_route_experiment(data: List[Dict[str, Any]], config: LLMFilterC
     print(f"✅ LLM Lite-Route Experiment completed")
     print(f"📊 Average F1: {overall_metrics['avg_f1']:.3f}")
     print(f"📊 Lite usage: {overall_metrics['model_usage']['lite_ratio']:.1%}")
+    print("\n" + "="*60 + "\n✅ Finished LLM Lite-Route Experiment\n" + "="*60, flush=True)
     
     return {
         'results': results,
@@ -1339,7 +1398,7 @@ def run_llm_lite_route_experiment(data: List[Dict[str, Any]], config: LLMFilterC
 
 def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
     """③ Large-scale LLM + Lightweight LLM + SetFit 실험 (온라인 학습)"""
-    print("🔄 Running LLM SetFit Experiment with Online Learning...")
+    print("\n" + "="*60 + "\n🚀 Starting LLM SetFit Experiment\n" + "="*60, flush=True)
     
     ollama = Ollama(config.ollama_url, config.temperature, config.top_p, config.seed)
     cache = ResponseCache(".cache/llm_setfit_cache.jsonl")
@@ -1348,6 +1407,7 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
     results = []
     start_time = time.time()
     total_queries = len(data)
+    pbar = tqdm(total=total_queries, desc="SetFit (online)", dynamic_ncols=True) if tqdm else None
     
     # SetFit 학습 데이터 수집 (온라인 학습용)
     learning_samples = []
@@ -1356,7 +1416,8 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
     print(f"📚 SetFit 온라인 학습 시작: 처음 {setfit_learning_threshold}개 쿼리로 학습")
     
     for idx, item in enumerate(data):
-        print(f"📊 SetFit 진행: {idx+1}/{total_queries} 쿼리 처리 중...")
+        if pbar: pbar.update(1)
+        else: print(f"📊 SetFit 진행: {idx+1}/{total_queries} 쿼리 처리 중...", flush=True)
         query = item['query']
         passages = item['passages']
         
@@ -1419,7 +1480,7 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
                 'latency_s': latency
             })
             
-            print(f"📖 학습 단계 {idx+1}/{setfit_learning_threshold}: {model_used} 모델 사용, F1={metrics['f1']:.3f}")
+            print(f"📖 학습 단계 {idx+1}/{setfit_learning_threshold}: {model_used} 모델 사용, F1={metrics['f1']:.3f}", flush=True)
         
         else:
             # SetFit 사용 단계: 충분한 학습 데이터가 있으면 SetFit 활성화
@@ -1538,9 +1599,10 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
                         setfit_helper.add_online(combined_text, label)
             
             setfit_str = f"{setfit_confidence:.3f}" if setfit_confidence is not None else "N/A"
-            print(f"🎯 SetFit 단계 {idx+1}: {model_used} 모델 사용, F1={metrics['f1']:.3f}, SetFit={setfit_str}")
+            print(f"🎯 SetFit 단계 {idx+1}: {model_used} 모델 사용, F1={metrics['f1']:.3f}, SetFit={setfit_str}", flush=True)
     
     end_time = time.time()
+    if pbar: pbar.close()
     
     # 전체 성능 계산
     all_precision = [r['metrics']['precision'] for r in results]
@@ -1583,6 +1645,7 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
     print(f"📊 Average F1: {overall_metrics['avg_f1']:.3f}")
     print(f"📊 Lite usage: {overall_metrics['model_usage']['lite_ratio']:.1%}")
     print(f"📊 SetFit 학습: {overall_metrics['setfit_usage']['learning_samples']}개 샘플, {overall_metrics['setfit_usage']['setfit_used_queries']}개 쿼리에서 사용")
+    print("\n" + "="*60 + "\n✅ Finished LLM SetFit Experiment\n" + "="*60, flush=True)
     
     return {
         'results': results,
@@ -1592,7 +1655,7 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
 
 def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
     """④ Large-scale LLM + Lightweight LLM + SetFit + CBC (Proposed) 실험 (온라인 학습)"""
-    print("🔄 Running LLM CBC Experiment with Online Learning...")
+    print("\n" + "="*60 + "\n🚀 Starting LLM CBC Experiment\n" + "="*60, flush=True)
     
     ollama = Ollama(config.ollama_url, config.temperature, config.top_p, config.seed)
     cache = ResponseCache(".cache/llm_cbc_cache.jsonl")
@@ -1601,6 +1664,7 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
     results = []
     start_time = time.time()
     total_queries = len(data)
+    pbar = tqdm(total=total_queries, desc="CBC (SetFit+Lite+Heavy)", dynamic_ncols=True) if tqdm else None
     
     # SetFit 학습 데이터 수집 (온라인 학습용)
     learning_samples = []
@@ -1609,7 +1673,8 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
     print(f"📚 CBC + SetFit 온라인 학습 시작: 처음 {setfit_learning_threshold}개 쿼리로 학습")
     
     for idx, item in enumerate(data):
-        print(f"📊 CBC 진행: {idx+1}/{total_queries} 쿼리 처리 중...")
+        if pbar: pbar.update(1)
+        else: print(f"📊 CBC 진행: {idx+1}/{total_queries} 쿼리 처리 중...", flush=True)
         query = item['query']
         passages = item['passages']
         
@@ -1672,7 +1737,7 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
                 'latency_s': latency
             })
             
-            print(f"📖 CBC 학습 단계 {idx+1}/{setfit_learning_threshold}: {model_used} 모델 사용, F1={metrics['f1']:.3f}")
+            print(f"📖 CBC 학습 단계 {idx+1}/{setfit_learning_threshold}: {model_used} 모델 사용, F1={metrics['f1']:.3f}", flush=True)
         
         else:
             # SetFit 사용 단계: 충분한 학습 데이터가 있으면 SetFit 활성화
@@ -1803,9 +1868,10 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
                         cbc_router.setfit_helper.add_online(combined_text, label)
             
             setfit_str = f"{setfit_confidence:.3f}" if setfit_confidence is not None else "N/A"
-            print(f"🎯 CBC 단계 {idx+1}: {model_used} 모델 사용, F1={metrics['f1']:.3f}, SetFit={setfit_str}")
+            print(f"🎯 CBC 단계 {idx+1}: {model_used} 모델 사용, F1={metrics['f1']:.3f}, SetFit={setfit_str}", flush=True)
     
     end_time = time.time()
+    if pbar: pbar.close()
     
     # 전체 성능 계산
     all_precision = [r['metrics']['precision'] for r in results]
@@ -1863,6 +1929,7 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
     print(f"📊 Average F1: {overall_metrics['avg_f1']:.3f}")
     print(f"📊 Model usage: SetFit={overall_metrics['model_usage']['setfit_ratio']:.1%}, Lite={overall_metrics['model_usage']['lite_ratio']:.1%}, Heavy={overall_metrics['model_usage']['heavy_ratio']:.1%}")
     print(f"📊 SetFit 학습: {overall_metrics['setfit_usage']['learning_samples']}개 샘플, {overall_metrics['setfit_usage']['setfit_used_queries']}개 쿼리에서 사용")
+    print("\n" + "="*60 + "\n✅ Finished LLM CBC Experiment\n" + "="*60, flush=True)
     
     return {
         'results': results,
@@ -1870,9 +1937,339 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
         'experiment_type': 'LLM_CBC_Online_Learning'
     }
 
+def run_integrated_llm_experiments(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
+    """통합 LLM 실험 - 모든 실험을 한 번에 실행하여 중복 제거"""
+    print("\n" + "="*80 + "\n🚀 Starting Integrated LLM Experiments (All-in-One)\n" + "="*80, flush=True)
+    
+    ollama = Ollama(config.ollama_url, config.temperature, config.top_p, config.seed)
+    cache = ResponseCache(".cache/integrated_llm_cache.jsonl")
+    setfit_helper = SetFitHelper()
+    cbc_router = CBCRouter(config)
+    
+    # 모든 실험 결과를 저장할 딕셔너리
+    all_results = {
+        'baseline': [],
+        'lite_route': [],
+        'setfit': [],
+        'cbc': []
+    }
+    
+    # 공통 변수들
+    start_time = time.time()
+    total_queries = len(data)
+    pbar = tqdm(total=total_queries, desc="Integrated Experiments", dynamic_ncols=True) if tqdm else None
+    
+    # SetFit 학습 데이터 수집
+    learning_samples = []
+    setfit_learning_threshold = config.warmup_k
+    
+    print(f"📚 통합 실험 시작: {total_queries}개 쿼리, 중복 계산 제거")
+    
+    for idx, item in enumerate(data):
+        if pbar: pbar.update(1)
+        else: print(f"📊 통합 실험 진행: {idx+1}/{total_queries} 쿼리 처리 중...", flush=True)
+        
+        query = item['query']
+        passages = item['passages']
+        ground_truth = item['relevance_labels']
+        
+        # 공통 프롬프트 생성 (한 번만)
+        prompt = create_llm_filtering_prompt(query, passages)
+        
+        # 1. Heavy LLM 결과 (모든 실험에서 공통 사용)
+        heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
+        heavy_decisions = parse_llm_decisions(heavy_response, len(passages))
+        heavy_metrics = calculate_f1_metrics_from_decisions(heavy_decisions, ground_truth)
+        
+        # Baseline 결과 저장
+        all_results['baseline'].append({
+            'query_id': item['query_id'],
+            'query': query,
+            'decisions': heavy_decisions,
+            'ground_truth': ground_truth,
+            'metrics': heavy_metrics,
+            'model_used': 'heavy',
+            'usage': heavy_usage,
+            'cost_per_query': 3,
+            'latency_s': heavy_usage.get('latency_s', 0.0)
+        })
+        
+        # 2. Lite LLM 결과 (Lite Route, SetFit, CBC에서 공통 사용)
+        lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
+        lite_decisions = parse_llm_decisions(lite_response, len(passages))
+        lite_confidences = [d['confidence'] for d in lite_decisions]
+        avg_lite_confidence = sum(lite_confidences) / len(lite_confidences) if lite_confidences else 0.5
+        
+        # Lite Route 실험
+        lite_routing_decision = simple_cbc_routing("KEEP", avg_lite_confidence, lite_confidences)
+        if lite_routing_decision == "continue":
+            # Heavy로 라우팅
+            final_decisions = heavy_decisions
+            model_used = 'heavy'
+            total_usage = {
+                'lite_tokens': lite_usage.get('total_tokens_est', 0),
+                'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
+                'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
+            }
+            cost = 2 + 3
+            latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
+        else:
+            # Lite에서 종료
+            final_decisions = lite_decisions
+            model_used = 'lite'
+            total_usage = lite_usage
+            cost = 2
+            latency = lite_usage.get('latency_s', 0.0)
+        
+        lite_route_metrics = calculate_f1_metrics_from_decisions(final_decisions, ground_truth)
+        all_results['lite_route'].append({
+            'query_id': item['query_id'],
+            'query': query,
+            'decisions': final_decisions,
+            'ground_truth': ground_truth,
+            'metrics': lite_route_metrics,
+            'model_used': model_used,
+            'lite_confidence': avg_lite_confidence,
+            'routing_decision': lite_routing_decision,
+            'usage': total_usage,
+            'cost_per_query': cost,
+            'latency_s': latency
+        })
+        
+        # 3. SetFit 실험 (처음부터 라우팅에 참여)
+        # SetFit 모델이 없으면 초기화
+        if setfit_helper.model is None and len(learning_samples) >= 4:  # 최소 4개 샘플
+            print(f"🎯 SetFit 모델 초기화: {len(learning_samples)}개 샘플로 학습")
+            texts, labels = zip(*learning_samples)
+            setfit_helper.warmup(list(texts), list(labels))
+        
+        if setfit_helper.model is not None:
+            # SetFit 예측 (처음부터 참여)
+            combined = [f"{query} [SEP] {p}" for p in passages]
+            probs = setfit_helper.model.predict_proba(combined)
+            setfit_scores = [float(p[1]) for p in probs]
+            setfit_confidence = np.mean(setfit_scores)
+            
+            # SetFit 라우팅 결정 (낮은 임계값으로 시작)
+            setfit_routing = simple_cbc_routing("KEEP", setfit_confidence, setfit_scores, 
+                                              absolute_threshold=0.6, percentile_threshold=70)
+            
+            if setfit_routing == "stop":
+                # SetFit에서 종료 (높은 신뢰도)
+                setfit_decisions = [{'decision': 'KEEP' if s >= 0.5 else 'DROP', 'confidence': s} for s in setfit_scores]
+                setfit_model_used = 'setfit'
+                setfit_usage = {'total_tokens_est': 0, 'latency_s': 0.0}
+                setfit_cost = 1
+                setfit_latency = 0.0
+            else:
+                # SetFit 신뢰도 낮음 → Lite LLM으로 라우팅
+                lite_routing_decision = simple_cbc_routing("KEEP", avg_lite_confidence, lite_confidences)
+                if lite_routing_decision == "continue":
+                    # Lite도 낮음 → Heavy로 라우팅
+                    setfit_decisions = heavy_decisions
+                    setfit_model_used = 'heavy'
+                    setfit_usage = {
+                        'lite_tokens': lite_usage.get('total_tokens_est', 0),
+                        'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
+                        'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
+                    }
+                    setfit_cost = 2 + 3
+                    setfit_latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
+                else:
+                    # Lite에서 종료
+                    setfit_decisions = lite_decisions
+                    setfit_model_used = 'lite'
+                    setfit_usage = lite_usage
+                    setfit_cost = 2
+                    setfit_latency = lite_usage.get('latency_s', 0.0)
+        else:
+            # SetFit 모델 없음 → Lite LLM 사용
+            lite_routing_decision = simple_cbc_routing("KEEP", avg_lite_confidence, lite_confidences)
+            if lite_routing_decision == "continue":
+                # Lite 신뢰도 낮음 → Heavy로 라우팅
+                setfit_decisions = heavy_decisions
+                setfit_model_used = 'heavy'
+                setfit_usage = {
+                    'lite_tokens': lite_usage.get('total_tokens_est', 0),
+                    'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
+                    'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
+                }
+                setfit_cost = 2 + 3
+                setfit_latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
+            else:
+                # Lite에서 종료
+                setfit_decisions = lite_decisions
+                setfit_model_used = 'lite'
+                setfit_usage = lite_usage
+                setfit_cost = 2
+                setfit_latency = lite_usage.get('latency_s', 0.0)
+            setfit_confidence = None
+        
+        setfit_metrics = calculate_f1_metrics_from_decisions(setfit_decisions, ground_truth)
+        all_results['setfit'].append({
+            'query_id': item['query_id'],
+            'query': query,
+            'decisions': setfit_decisions,
+            'ground_truth': ground_truth,
+            'metrics': setfit_metrics,
+            'model_used': setfit_model_used,
+            'setfit_confidence': setfit_confidence,
+            'usage': setfit_usage,
+            'cost_per_query': setfit_cost,
+            'latency_s': setfit_latency
+        })
+        
+        # 4. CBC 실험 (SetFit + Lite + Heavy + CBC 라우팅)
+        # CBC SetFit 모델이 없으면 초기화
+        if cbc_router.setfit_helper.model is None and len(learning_samples) >= 4:  # 최소 4개 샘플
+            print(f"🎯 CBC + SetFit 모델 초기화: {len(learning_samples)}개 샘플로 학습")
+            texts, labels = zip(*learning_samples)
+            cbc_router.setfit_helper.warmup(list(texts), list(labels))
+        
+        if cbc_router.setfit_helper.model is not None:
+            # CBC SetFit 예측 (처음부터 참여)
+            combined = [f"{query} [SEP] {p}" for p in passages]
+            probs = cbc_router.setfit_helper.model.predict_proba(combined)
+            cbc_scores = [float(p[1]) for p in probs]
+            cbc_confidence = np.mean(cbc_scores)
+            
+            # CBC 라우팅 결정 (낮은 임계값으로 시작)
+            cbc_routing = simple_cbc_routing("KEEP", cbc_confidence, cbc_scores, 
+                                           absolute_threshold=0.6, percentile_threshold=70)
+            
+            if cbc_routing == "stop":
+                # CBC SetFit에서 종료 (높은 신뢰도)
+                cbc_decisions = [{'decision': 'KEEP' if s >= 0.5 else 'DROP', 'confidence': s} for s in cbc_scores]
+                cbc_model_used = 'setfit'
+                cbc_usage = {'total_tokens_est': 0, 'latency_s': 0.0}
+                cbc_cost = 1
+                cbc_latency = 0.0
+            else:
+                # CBC SetFit 신뢰도 낮음 → Lite LLM으로 라우팅
+                lite_routing_decision = simple_cbc_routing("KEEP", avg_lite_confidence, lite_confidences)
+                if lite_routing_decision == "continue":
+                    # Lite도 낮음 → Heavy로 라우팅
+                    cbc_decisions = heavy_decisions
+                    cbc_model_used = 'heavy'
+                    cbc_usage = {
+                        'lite_tokens': lite_usage.get('total_tokens_est', 0),
+                        'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
+                        'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
+                    }
+                    cbc_cost = 2 + 3
+                    cbc_latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
+                else:
+                    # Lite에서 종료
+                    cbc_decisions = lite_decisions
+                    cbc_model_used = 'lite'
+                    cbc_usage = lite_usage
+                    cbc_cost = 2
+                    cbc_latency = lite_usage.get('latency_s', 0.0)
+        else:
+            # CBC SetFit 모델 없음 → Lite LLM 사용
+            lite_routing_decision = simple_cbc_routing("KEEP", avg_lite_confidence, lite_confidences)
+            if lite_routing_decision == "continue":
+                # Lite 신뢰도 낮음 → Heavy로 라우팅
+                cbc_decisions = heavy_decisions
+                cbc_model_used = 'heavy'
+                cbc_usage = {
+                    'lite_tokens': lite_usage.get('total_tokens_est', 0),
+                    'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
+                    'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
+                }
+                cbc_cost = 2 + 3
+                cbc_latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
+            else:
+                # Lite에서 종료
+                cbc_decisions = lite_decisions
+                cbc_model_used = 'lite'
+                cbc_usage = lite_usage
+                cbc_cost = 2
+                cbc_latency = lite_usage.get('latency_s', 0.0)
+            cbc_confidence = None
+        
+        cbc_metrics = calculate_f1_metrics_from_decisions(cbc_decisions, ground_truth)
+        all_results['cbc'].append({
+            'query_id': item['query_id'],
+            'query': query,
+            'decisions': cbc_decisions,
+            'ground_truth': ground_truth,
+            'metrics': cbc_metrics,
+            'model_used': cbc_model_used,
+            'cbc_confidence': cbc_confidence,
+            'usage': cbc_usage,
+            'cost_per_query': cbc_cost,
+            'latency_s': cbc_latency
+        })
+        
+        # SetFit 온라인 학습 (SetFit이 사용되지 않은 경우만 학습)
+        # SetFit이 사용된 경우: 학습하지 않음 (이미 확신을 가지고 결정했으므로)
+        # SetFit이 사용되지 않은 경우: L/H LLM의 결과를 학습
+        if setfit_helper.model is not None:
+            for i, passage in enumerate(passages):
+                combined_text = f"{query} [SEP] {passage}"
+                # SetFit이 사용되지 않은 경우만 학습
+                if setfit_confidence is None:
+                    # L/H LLM의 직접적인 결과를 학습 (Ground Truth와 일치하는 경우만)
+                    if lite_route_decisions[i]['decision'] == 'KEEP' and ground_truth[i] == 1:
+                        setfit_helper.add_online(combined_text, "HIGH")
+                    elif lite_route_decisions[i]['decision'] == 'DROP' and ground_truth[i] == 0:
+                        setfit_helper.add_online(combined_text, "LOW")
+        
+        # CBC SetFit 온라인 학습 (CBC SetFit이 사용되지 않은 경우만 학습)
+        # CBC SetFit이 사용된 경우: 학습하지 않음 (이미 확신을 가지고 결정했으므로)
+        # CBC SetFit이 사용되지 않은 경우: L/H LLM의 결과를 학습
+        if cbc_router.setfit_helper.model is not None:
+            for i, passage in enumerate(passages):
+                combined_text = f"{query} [SEP] {passage}"
+                # CBC SetFit이 사용되지 않은 경우만 학습
+                if cbc_setfit_confidence is None:
+                    # L/H LLM의 직접적인 결과를 학습 (Ground Truth와 일치하는 경우만)
+                    if lite_route_decisions[i]['decision'] == 'KEEP' and ground_truth[i] == 1:
+                        cbc_router.setfit_helper.add_online(combined_text, "HIGH")
+                    elif lite_route_decisions[i]['decision'] == 'DROP' and ground_truth[i] == 0:
+                        cbc_router.setfit_helper.add_online(combined_text, "LOW")
+    
+    end_time = time.time()
+    if pbar: pbar.close()
+    
+    # 각 실험별 전체 성능 계산
+    experiment_results = {}
+    for exp_name, results in all_results.items():
+        if not results:
+            continue
+            
+        all_precision = [r['metrics']['precision'] for r in results]
+        all_recall = [r['metrics']['recall'] for r in results]
+        all_f1 = [r['metrics']['f1'] for r in results]
+        all_latency = [r.get('latency_s', 0.0) for r in results]
+        all_cost = [r.get('cost_per_query', 3) for r in results]
+        
+        overall_metrics = {
+            'avg_precision': np.mean(all_precision),
+            'avg_recall': np.mean(all_recall),
+            'avg_f1': np.mean(all_f1),
+            'total_time': end_time - start_time,
+            'avg_time_per_query': (end_time - start_time) / len(results),
+            'avg_latency_ms': 1000.0 * np.mean(all_latency),
+            'avg_cost_per_query': np.mean(all_cost)
+        }
+        
+        experiment_results[exp_name] = {
+            'results': results,
+            'overall_metrics': overall_metrics,
+            'experiment_type': f'LLM_{exp_name.upper()}'
+        }
+    
+    print(f"\n✅ 통합 실험 완료!")
+    print(f"📊 총 소요 시간: {end_time - start_time:.1f}초")
+    print(f"📊 평균 쿼리당 시간: {(end_time - start_time) / total_queries:.1f}초")
+    
+    return experiment_results
+
 def run_ms_marco_llm_experiments(max_queries: int = 10) -> Dict[str, Any]:
-    """MS MARCO 데이터셋에 대한 LLM 필터링 실험 실행"""
-    print("🚀 MS MARCO LLM Filtering Experiments")
+    """MS MARCO 데이터셋에 대한 LLM 필터링 실험 실행 (통합 버전)"""
+    print("🚀 MS MARCO LLM Filtering Experiments (Integrated)")
     print("=" * 60)
     
     # 데이터 로드
@@ -1884,28 +2281,16 @@ def run_ms_marco_llm_experiments(max_queries: int = 10) -> Dict[str, Any]:
     # 설정
     config = LLMFilterConfig(
         max_queries=max_queries,
-        theta=0.8,  # 높은 신뢰도 기준
-        warmup_k=4,  # SetFit 학습용 최소 쿼리 수
+        theta=0.6,  # 낮은 신뢰도 기준 (더 관대하게)
+        warmup_k=1,  # SetFit 학습용 최소 쿼리 수 (즉시 활성화)
+        setfit_epochs=1,  # SetFit 학습 epochs (속도 최적화)
+        setfit_batch_size=4,  # SetFit batch size (속도 최적화)
         seed=42
     )
     
-    experiments = {}
-    
-    # ① Large-scale LLM Only (Baseline)
-    print("\n📊 Experiment 1: Large-scale LLM Only (Baseline)")
-    experiments['baseline'] = run_llm_baseline_experiment(data, config)
-    
-    # ② Large-scale LLM + Lightweight LLM
-    print("\n📊 Experiment 2: Large-scale LLM + Lightweight LLM")
-    experiments['lite_route'] = run_llm_lite_route_experiment(data, config)
-    
-    # ③ Large-scale LLM + Lightweight LLM + SetFit
-    print("\n📊 Experiment 3: Large-scale LLM + Lightweight LLM + SetFit")
-    experiments['setfit'] = run_llm_setfit_experiment(data, config)
-    
-    # ④ Large-scale LLM + Lightweight LLM + SetFit + CBC (Proposed)
-    print("\n📊 Experiment 4: Large-scale LLM + Lightweight LLM + SetFit + CBC (Proposed)")
-    experiments['cbc'] = run_llm_cbc_experiment(data, config)
+    # 통합 실험 실행 (중복 제거)
+    print("\n📊 통합 실험 실행: 모든 실험을 한 번에 처리하여 중복 계산 제거")
+    experiments = run_integrated_llm_experiments(data, config)
     
     # 결과 비교
     print("\n📈 MS MARCO LLM Filtering Results Summary")

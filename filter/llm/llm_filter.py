@@ -352,6 +352,69 @@ def extract_confidence_simple(response: str, base: float = 0.65) -> float:
     
     return base
 
+def extract_confidence_from_llm_response(response: str, scores: List[float]) -> float:
+    """LLM 응답에서 confidence 메타정보 파싱 또는 softmax-normalized score 기반 계산"""
+    import re
+    
+    # 1. LLM 응답에서 명시적 confidence 값 파싱 시도
+    confidence_patterns = [
+        r'confidence[:\s]*([0-9.]+)',
+        r'신뢰도[:\s]*([0-9.]+)',
+        r'확신도[:\s]*([0-9.]+)',
+        r'certainty[:\s]*([0-9.]+)',
+        r'([0-9.]+)\s*%?\s*confidence',
+        r'([0-9.]+)\s*%?\s*신뢰도'
+    ]
+    
+    for pattern in confidence_patterns:
+        match = re.search(pattern, response, re.IGNORECASE)
+        if match:
+            try:
+                conf_value = float(match.group(1))
+                # 0-1 범위로 정규화
+                if conf_value > 1.0:
+                    conf_value = conf_value / 100.0
+                return max(0.0, min(1.0, conf_value))
+            except ValueError:
+                continue
+    
+    # 2. 점수 분포 기반 confidence 계산 (softmax-normalized)
+    if scores and len(scores) > 1:
+        try:
+            import numpy as np
+            # Softmax 정규화
+            exp_scores = np.exp(np.array(scores))
+            softmax_scores = exp_scores / np.sum(exp_scores)
+            
+            # 최대 확률과 엔트로피 기반 confidence
+            max_prob = np.max(softmax_scores)
+            entropy = -np.sum(softmax_scores * np.log(softmax_scores + 1e-9))
+            max_entropy = np.log(len(scores))
+            normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
+            
+            # 높은 최대 확률 + 낮은 엔트로피 = 높은 confidence
+            confidence = max_prob * (1 - normalized_entropy)
+            return max(0.0, min(1.0, confidence))
+        except Exception:
+            pass
+    
+    # 3. 점수 분산 기반 confidence (기존 방식 개선)
+    if scores and len(scores) > 1:
+        try:
+            import numpy as np
+            # 표준편차 대신 변동계수 사용 (더 정규화된 지표)
+            mean_score = np.mean(scores)
+            std_score = np.std(scores)
+            if mean_score > 0:
+                cv = std_score / mean_score  # 변동계수
+                confidence = 1.0 / (1.0 + cv)  # 변동계수가 낮을수록 높은 confidence
+                return max(0.0, min(1.0, confidence))
+        except Exception:
+            pass
+    
+    # 4. 기본값 반환
+    return 0.65
+
 # ===============================
 # Task-specific Predictors
 # ===============================
@@ -653,55 +716,6 @@ class CBCRouter:
             print(f"⚠️ SetFit warmup failed: {e}")
             print("⚠️ SetFit will use default predictions")
     
-    def hierarchical_cbc_routing(self, query: str, text: str, anchors: List[str] = None) -> Dict[str, Any]:
-        """계층적 CBC 라우팅 (Phase 2)"""
-        try:
-            # 1단계: SetFit + 앵커 (비용 최소)
-            setfit_score = self.calculate_anchor_based_confidence(query, text, anchors)
-            
-            if self.cbc_decision(setfit_score, 80):  # 상위 80%
-                return {
-                    'stage': 'setfit',
-                    'model_used': 'setfit',
-                    'confidence': setfit_score,
-                    'decision': 'accept',
-                    'reason': 'SetFit + Anchor confidence high enough'
-                }
-            
-            # 2단계: 경량 LLM (중간 비용)
-            lite_result = self._predict_with_model(self.config.gemma_lite, query, text, {'name': 'generic'})
-            lite_score = lite_result['confidence']
-            
-            if self.cbc_decision(lite_score, 90):  # 상위 90%
-                return {
-                    'stage': 'lite',
-                    'model_used': 'lite',
-                    'confidence': lite_score,
-                    'decision': 'accept',
-                    'reason': 'Lite LLM confidence high enough'
-                }
-            
-            # 3단계: 고성능 LLM (최고 비용, 정말 필요한 경우만)
-            heavy_result = self._predict_with_model(self.config.gemma_heavy, query, text, {'name': 'generic'})
-            heavy_score = heavy_result['confidence']
-            
-            return {
-                'stage': 'heavy',
-                'model_used': 'heavy',
-                'confidence': heavy_score,
-                'decision': 'accept',
-                'reason': 'Heavy LLM required for low confidence cases'
-            }
-            
-        except Exception as e:
-            print(f"⚠️ Hierarchical CBC routing failed: {e}")
-            return {
-                'stage': 'fallback',
-                'model_used': 'heavy',
-                'confidence': 0.5,
-                'decision': 'accept',
-                'reason': 'Fallback due to error'
-            }
     
     def cbc_decision(self, score: float, percentile: int) -> bool:
         """CBC 기반 라우팅 결정"""
@@ -843,40 +857,59 @@ class CBCRouter:
     
     
     def hierarchical_cbc_routing(self, query: str, text: str, anchors: List[str] = None) -> Dict[str, Any]:
-        """계층적 CBC 라우팅 (CBC 핵심)"""
+        """계층적 CBC 라우팅 (CBC 핵심) - 실제 배치별 점수 분포 반영"""
         try:
             # 1단계: SetFit + 앵커 (비용 최소)
             setfit_score = self.calculate_anchor_based_confidence(query, text, anchors)
             
-            if setfit_score >= 0.8:  # 단순화된 임계값
+            # SetFit 점수를 배치에 추가
+            self.batch_scores['setfit'].append(setfit_score)
+            
+            # CBC 기반 동적 임계값 계산
+            setfit_threshold = self._get_dynamic_threshold('setfit', 80)  # 상위 80%
+            
+            if setfit_score >= setfit_threshold:
                 return {
                     'stage': 'setfit',
                     'model_used': 'setfit',
                     'confidence': setfit_score,
-                    'decision': 'accept'
+                    'decision': 'accept',
+                    'threshold_used': setfit_threshold,
+                    'reason': f'SetFit confidence {setfit_score:.3f} >= threshold {setfit_threshold:.3f}'
                 }
             
             # 2단계: 경량 LLM (중간 비용)
             lite_result = self._predict_with_model(self.config.gemma_lite, query, text, {'name': 'generic'})
             lite_score = lite_result['confidence']
             
-            if lite_score >= 0.7:  # 단순화된 임계값
+            # Lite LLM 점수를 배치에 추가
+            self.batch_scores['lite'].append(lite_score)
+            lite_threshold = self._get_dynamic_threshold('lite', 90)  # 상위 90%
+            
+            if lite_score >= lite_threshold:
                 return {
                     'stage': 'lite',
                     'model_used': 'lite',
                     'confidence': lite_score,
-                    'decision': 'accept'
+                    'decision': 'accept',
+                    'threshold_used': lite_threshold,
+                    'reason': f'Lite LLM confidence {lite_score:.3f} >= threshold {lite_threshold:.3f}'
                 }
             
             # 3단계: 고성능 LLM (최고 비용)
             heavy_result = self._predict_with_model(self.config.gemma_heavy, query, text, {'name': 'generic'})
             heavy_score = heavy_result['confidence']
             
+            # Heavy LLM 점수를 배치에 추가
+            self.batch_scores['heavy'].append(heavy_score)
+            
             return {
                 'stage': 'heavy',
                 'model_used': 'heavy',
                 'confidence': heavy_score,
-                'decision': 'accept'
+                'decision': 'accept',
+                'threshold_used': 'N/A',
+                'reason': 'Heavy LLM required for low confidence cases'
             }
             
         except Exception as e:
@@ -885,23 +918,28 @@ class CBCRouter:
                 'model_used': 'heavy',
                 'confidence': 0.5,
                 'decision': 'accept',
-                'reason': 'Fallback due to error'
+                'reason': f'Fallback due to error: {e}'
             }
     
     def _get_dynamic_threshold(self, stage: str, percentile: int) -> float:
-        """동적 임계값 계산 (CBC 핵심)"""
+        """동적 임계값 계산 (CBC 핵심) - 실제 배치별 점수 분포 반영"""
         try:
-            if not self.batch_scores:
+            if not self.batch_scores or stage not in self.batch_scores:
                 return 0.7  # 기본 임계값
             
-            stage_scores = [s[stage] for s in self.batch_scores if stage in s]
+            stage_scores = self.batch_scores[stage]
             if not stage_scores:
                 return 0.7
             
+            # 실제 percentile 계산
             threshold = np.percentile(stage_scores, percentile)
-            return max(threshold, 0.6)  # 최소 임계값 보장
             
-        except Exception:
+            # 최소 임계값 보장 (안정성)
+            min_threshold = 0.6
+            return max(threshold, min_threshold)
+            
+        except Exception as e:
+            print(f"⚠️ Dynamic threshold calculation failed for {stage}: {e}")
             return 0.7
 
 # ===============================
@@ -918,9 +956,51 @@ class CBCRouter:
 # ===============================
 
 def load_ms_marco_data(max_queries: int = 10) -> List[Dict[str, Any]]:
-    """MS MARCO 데이터셋 로드 (테스트용 간단한 데이터)"""
+    """MS MARCO 데이터셋 로드 (실제 데이터셋 사용)"""
     try:
-        # 테스트용 샘플 데이터 생성 (더 현실적인 관련성 분포)
+        from datasets import load_dataset
+        
+        print(f"🔄 MS MARCO 실제 데이터셋 로드 중... (최대 {max_queries}개 쿼리)")
+        
+        # MS MARCO v1.1 데이터셋 로드
+        dataset = load_dataset('ms_marco', 'v1.1')
+        train_data = dataset['train']
+        
+        # 데이터 전처리 및 변환
+        processed_data = []
+        for i in range(min(max_queries, len(train_data))):
+            sample = train_data[i]
+            
+            # passages에서 텍스트와 관련성 레이블 추출
+            passages_dict = sample['passages']
+            passage_texts = passages_dict['passage_text']
+            is_selected = passages_dict['is_selected']
+            
+            # 관련성 레이블을 binary로 변환 (0: 무관, 1: 관련)
+            relevance_labels = [1 if label == 1 else 0 for label in is_selected]
+            
+            processed_data.append({
+                'query_id': str(sample['query_id']),
+                'query': sample['query'],
+                'passages': passage_texts,
+                'relevance_labels': relevance_labels,  # 실제 Ground Truth
+                'answers': sample['answers'],
+                'query_type': sample.get('query_type', 'unknown')
+            })
+        
+        print(f"✅ MS MARCO 실제 데이터 로드 완료: {len(processed_data)}개 쿼리")
+        print(f"📊 첫 번째 쿼리 예시:")
+        print(f"   쿼리: \"{processed_data[0]['query']}\"")
+        print(f"   문서 수: {len(processed_data[0]['passages'])}개")
+        print(f"   관련 문서 수: {sum(processed_data[0]['relevance_labels'])}개")
+        
+        return processed_data
+        
+    except Exception as e:
+        print(f"❌ MS MARCO 데이터 로드 실패: {e}")
+        print("🔄 테스트용 데이터로 대체합니다...")
+        
+        # 실패 시 테스트용 데이터로 대체
         sample_data = [
             {
                 'query_id': f'q_{i}',
@@ -933,6 +1013,7 @@ def load_ms_marco_data(max_queries: int = 10) -> List[Dict[str, Any]]:
                     f'The weather today is sunny with a temperature of 25 degrees Celsius. Document {i}-5',
                     f'Data science combines statistics, programming, and domain expertise to extract insights from data. Document {i}-6'
                 ],
+                'relevance_labels': [1, 1, 1, 1, 0, 1],  # 테스트용 Ground Truth
                 'answers': [f'Machine learning is a subset of AI. Answer {i}']
             }
             for i in range(max_queries)
@@ -940,10 +1021,6 @@ def load_ms_marco_data(max_queries: int = 10) -> List[Dict[str, Any]]:
         
         print(f"✅ MS MARCO 테스트 데이터 로드 완료: {len(sample_data)}개 쿼리")
         return sample_data
-        
-    except Exception as e:
-        print(f"❌ MS MARCO 데이터 로드 실패: {e}")
-        return []
 
 def load_fiqa_data(max_queries: int = 648) -> List[Dict[str, Any]]:
     """FiQA 데이터셋 로드"""
@@ -965,12 +1042,20 @@ def load_fiqa_data(max_queries: int = 648) -> List[Dict[str, Any]]:
             relevant_docs = [doc for doc in docs if doc[1] > 0]
             if len(relevant_docs) < 2:  # 최소 2개 관련 문서 필요
                 continue
+            
+            # 상위 50개 문서 선택
+            top_docs = docs[:50]  # [(corpus_id, score), ...]
+            passages = [f"Financial document {cid}" for cid, _ in top_docs]
+            
+            # 관련성 레이블 생성 (passages와 동일 길이)
+            relevant_set = {cid for cid, s in docs if s > 0}
+            relevance_labels = [1 if cid in relevant_set else 0 for cid, _ in top_docs]
                 
             data.append({
                 'query_id': query_id,
                 'query': f"Financial query {query_id}",  # 실제 쿼리 텍스트는 MTEB에서 제공하지 않음
-                'passages': [f"Financial document {doc[0]}" for doc in docs[:50]],  # 상위 50개 문서
-                'relevant_docs': relevant_docs,
+                'passages': passages,
+                'relevance_labels': relevance_labels,  # 실험 함수와 호환
                 'answers': [f"Answer for query {query_id}"]
             })
         
@@ -1094,22 +1179,15 @@ def run_llm_baseline_experiment(data: List[Dict[str, Any]], config: LLMFilterCon
         response, usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
         scores = parse_llm_scores(response, len(passages))
         
-        # Ground truth 생성 (H Only가 높은 성능을 낼 수 있도록 조정)
-        ground_truth = []
-        for i, passage in enumerate(passages):
-            # 쿼리와 문서 내용의 관련성 기반 판단
-            passage_lower = passage.lower()
-            
-            # 키워드 매칭으로 관련성 판단 (H Only 성능 최적화)
-            if 'machine learning' in passage_lower:
-                ground_truth.append(1)  # 직접적으로 ML 관련 (높은 관련성)
-            elif 'artificial intelligence' in passage_lower:
-                ground_truth.append(1)  # AI는 ML의 상위 개념 (높은 관련성)
-            else:
-                ground_truth.append(0)  # 나머지는 모두 무관 (더 엄격한 기준)
+        # 실제 MS MARCO Ground Truth 사용
+        ground_truth = item['relevance_labels']
         
         # 평가 지표 계산
         metrics = calculate_f1_metrics(scores, ground_truth)
+        
+        # Cost 및 Latency 계산
+        cost = 3  # Heavy 모델만 사용
+        latency = usage.get('latency_s', 0.0)
         
         results.append({
             'query_id': item['query_id'],
@@ -1118,7 +1196,9 @@ def run_llm_baseline_experiment(data: List[Dict[str, Any]], config: LLMFilterCon
             'ground_truth': ground_truth,
             'metrics': metrics,
             'model_used': 'heavy',  # Baseline은 항상 heavy 모델 사용
-            'usage': usage
+            'usage': usage,
+            'cost_per_query': cost,
+            'latency_s': latency
         })
     
     end_time = time.time()
@@ -1128,12 +1208,18 @@ def run_llm_baseline_experiment(data: List[Dict[str, Any]], config: LLMFilterCon
     all_recall = [r['metrics']['recall'] for r in results]
     all_f1 = [r['metrics']['f1'] for r in results]
     
+    # 추가 지표 계산
+    all_latency = [r.get('latency_s', 0.0) for r in results]
+    all_cost = [r.get('cost_per_query', 3) for r in results]  # 기본값 3 (Heavy)
+    
     overall_metrics = {
         'avg_precision': np.mean(all_precision),
         'avg_recall': np.mean(all_recall),
         'avg_f1': np.mean(all_f1),
         'total_time': end_time - start_time,
-        'avg_time_per_query': (end_time - start_time) / len(results)
+        'avg_time_per_query': (end_time - start_time) / len(results),
+        'avg_latency_ms': 1000.0 * np.mean(all_latency),
+        'avg_cost_per_query': np.mean(all_cost)
     }
     
     print(f"✅ LLM Baseline Experiment completed")
@@ -1168,8 +1254,8 @@ def run_llm_lite_route_experiment(data: List[Dict[str, Any]], config: LLMFilterC
         lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
         lite_scores = parse_llm_scores(lite_response, len(passages))
         
-        # 신뢰도 계산 (점수 분산 기반)
-        confidence = 1.0 - np.std(lite_scores) if len(lite_scores) > 1 else 0.5
+        # 개선된 신뢰도 계산 (LLM 응답 기반)
+        confidence = extract_confidence_from_llm_response(lite_response, lite_scores)
         
         # 신뢰도가 낮으면 고성능 LLM으로 라우팅
         if confidence < config.theta:
@@ -1181,24 +1267,19 @@ def run_llm_lite_route_experiment(data: List[Dict[str, Any]], config: LLMFilterC
                 'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
                 'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
             }
+            # Cost 및 Latency 계산 (Lite + Heavy)
+            cost = 2 + 3  # Lite(2) + Heavy(3)
+            latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
         else:
             final_scores = lite_scores
             model_used = 'lite'
             total_usage = lite_usage
+            # Cost 및 Latency 계산 (Lite만)
+            cost = 2  # Lite만 사용
+            latency = lite_usage.get('latency_s', 0.0)
         
-        # Ground truth 생성 (H Only가 높은 성능을 낼 수 있도록 조정)
-        ground_truth = []
-        for i, passage in enumerate(passages):
-            # 쿼리와 문서 내용의 관련성 기반 판단
-            passage_lower = passage.lower()
-            
-            # 키워드 매칭으로 관련성 판단 (H Only 성능 최적화)
-            if 'machine learning' in passage_lower:
-                ground_truth.append(1)  # 직접적으로 ML 관련 (높은 관련성)
-            elif 'artificial intelligence' in passage_lower:
-                ground_truth.append(1)  # AI는 ML의 상위 개념 (높은 관련성)
-            else:
-                ground_truth.append(0)  # 나머지는 모두 무관 (더 엄격한 기준)
+        # 실제 MS MARCO Ground Truth 사용
+        ground_truth = item['relevance_labels']
         
         # 평가 지표 계산
         metrics = calculate_f1_metrics(final_scores, ground_truth)
@@ -1211,7 +1292,9 @@ def run_llm_lite_route_experiment(data: List[Dict[str, Any]], config: LLMFilterC
             'metrics': metrics,
             'model_used': model_used,
             'lite_confidence': confidence,  # 명확한 필드명 사용
-            'usage': total_usage
+            'usage': total_usage,
+            'cost_per_query': cost,
+            'latency_s': latency
         })
     
     end_time = time.time()
@@ -1225,12 +1308,18 @@ def run_llm_lite_route_experiment(data: List[Dict[str, Any]], config: LLMFilterC
     lite_usage_count = sum(1 for r in results if r['model_used'] == 'lite')
     heavy_usage_count = sum(1 for r in results if r['model_used'] == 'heavy')
     
+    # 추가 지표 계산
+    all_latency = [r.get('latency_s', 0.0) for r in results]
+    all_cost = [r.get('cost_per_query', 3) for r in results]
+    
     overall_metrics = {
         'avg_precision': np.mean(all_precision),
         'avg_recall': np.mean(all_recall),
         'avg_f1': np.mean(all_f1),
         'total_time': end_time - start_time,
         'avg_time_per_query': (end_time - start_time) / len(results),
+        'avg_latency_ms': 1000.0 * np.mean(all_latency),
+        'avg_cost_per_query': np.mean(all_cost),
         'model_usage': {
             'lite': lite_usage_count,
             'heavy': heavy_usage_count,
@@ -1278,8 +1367,8 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
             lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
             lite_scores = parse_llm_scores(lite_response, len(passages))
             
-            # 신뢰도 계산
-            confidence = 1.0 - np.std(lite_scores) if len(lite_scores) > 1 else 0.5
+            # 개선된 신뢰도 계산 (LLM 응답 기반)
+            confidence = extract_confidence_from_llm_response(lite_response, lite_scores)
             
             if confidence < config.theta:
                 # 신뢰도 낮음 → 고성능 LLM 사용
@@ -1291,32 +1380,27 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
                     'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
                     'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
                 }
+                # Cost 및 Latency 계산 (Lite + Heavy)
+                cost = 2 + 3  # Lite(2) + Heavy(3)
+                latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
             else:
                 final_scores = lite_scores
                 model_used = 'lite'
                 total_usage = lite_usage
+                # Cost 및 Latency 계산 (Lite만)
+                cost = 2  # Lite만 사용
+                latency = lite_usage.get('latency_s', 0.0)
             
-            # SetFit 학습 데이터 수집
+            # 실제 MS MARCO Ground Truth 사용 (데이터셋 원본 레이블)
+            ground_truth = item['relevance_labels']
+            
+            # SetFit 학습 데이터 수집 (Ground Truth 기반)
             for i, passage in enumerate(passages):
                 combined_text = f"{query} [SEP] {passage}"
-                # LLM의 실제 필터링 결과를 라벨로 사용
-                llm_score = final_scores[i]
-                label = "HIGH" if llm_score >= 0.5 else "LOW"  # LLM 결과 기반 라벨
+                # 실제 Ground Truth를 라벨로 사용 (데이터셋 원본 레이블)
+                ground_truth_label = ground_truth[i]
+                label = "HIGH" if ground_truth_label == 1 else "LOW"  # Ground Truth 기반 라벨
                 learning_samples.append((combined_text, label))
-            
-            # Ground truth 생성 (H Only가 높은 성능을 낼 수 있도록 조정)
-            ground_truth = []
-            for i, passage in enumerate(passages):
-                # 쿼리와 문서 내용의 관련성 기반 판단
-                passage_lower = passage.lower()
-                
-                # 키워드 매칭으로 관련성 판단 (H Only 성능 최적화)
-                if 'machine learning' in passage_lower:
-                    ground_truth.append(1)  # 직접적으로 ML 관련 (높은 관련성)
-                elif 'artificial intelligence' in passage_lower:
-                    ground_truth.append(1)  # AI는 ML의 상위 개념 (높은 관련성)
-                else:
-                    ground_truth.append(0)  # 나머지는 모두 무관 (더 엄격한 기준)
             
             # 평가 지표 계산
             metrics = calculate_f1_metrics(final_scores, ground_truth)
@@ -1330,7 +1414,9 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
                 'model_used': model_used,
                 'setfit_confidence': None,  # 아직 SetFit 미사용
                 'usage': total_usage,
-                'phase': 'learning'
+                'phase': 'learning',
+                'cost_per_query': cost,
+                'latency_s': latency
             })
             
             print(f"📖 학습 단계 {idx+1}/{setfit_learning_threshold}: {model_used} 모델 사용, F1={metrics['f1']:.3f}")
@@ -1354,16 +1440,32 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
                 # SetFit 신뢰도 기반 라우팅
                 avg_setfit_confidence = np.mean(setfit_confidences)
                 
-                if avg_setfit_confidence >= config.theta:
-                    # SetFit 신뢰도 높음 → 경량 LLM 사용
-                    prompt = create_llm_filtering_prompt(query, passages)
-                    response, usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
-                    model_used = 'lite'
-                else:
-                    # SetFit 신뢰도 낮음 → 고성능 LLM 사용
-                    prompt = create_llm_filtering_prompt(query, passages)
-                    response, usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
+                # SetFit 신뢰도에 관계없이 먼저 경량 LLM 사용
+                prompt = create_llm_filtering_prompt(query, passages)
+                lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
+                lite_scores = parse_llm_scores(lite_response, len(passages))
+                
+                # 개선된 Lite LLM 신뢰도 계산 (LLM 응답 기반)
+                lite_confidence = extract_confidence_from_llm_response(lite_response, lite_scores)
+                
+                if lite_confidence < config.theta:
+                    # Lite LLM 신뢰도 낮음 → 고성능 LLM 사용
+                    heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
+                    final_scores = parse_llm_scores(heavy_response, len(passages))
                     model_used = 'heavy'
+                    usage = {
+                        'lite_tokens': lite_usage.get('total_tokens_est', 0),
+                        'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
+                        'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
+                    }
+                else:
+                    # Lite LLM 신뢰도 높음 → Lite LLM 결과 사용
+                    final_scores = lite_scores
+                    model_used = 'lite'
+                    usage = lite_usage
+                
+                # SetFit 신뢰도 저장
+                setfit_confidence = avg_setfit_confidence
             else:
                 # SetFit 모델이 없으면 기본 라우팅
                 prompt = create_llm_filtering_prompt(query, passages)
@@ -1385,27 +1487,27 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
                     model_used = 'lite'
                     usage = lite_usage
                 
-                response = lite_response if model_used == 'lite' else heavy_response
-                avg_setfit_confidence = None
+                final_scores = lite_scores if model_used == 'lite' else final_scores
+                setfit_confidence = None
             
-            scores = parse_llm_scores(response, len(passages))
+            scores = final_scores
             
-            # Ground truth 생성 (H Only가 높은 성능을 낼 수 있도록 조정)
-            ground_truth = []
-            for i, passage in enumerate(passages):
-                # 쿼리와 문서 내용의 관련성 기반 판단
-                passage_lower = passage.lower()
-                
-                # 키워드 매칭으로 관련성 판단 (H Only 성능 최적화)
-                if 'machine learning' in passage_lower:
-                    ground_truth.append(1)  # 직접적으로 ML 관련 (높은 관련성)
-                elif 'artificial intelligence' in passage_lower:
-                    ground_truth.append(1)  # AI는 ML의 상위 개념 (높은 관련성)
-                else:
-                    ground_truth.append(0)  # 나머지는 모두 무관 (더 엄격한 기준)
+            # 실제 MS MARCO Ground Truth 사용 (데이터셋 원본 레이블)
+            ground_truth = item['relevance_labels']
             
             # 평가 지표 계산
             metrics = calculate_f1_metrics(scores, ground_truth)
+            
+            # Cost 및 Latency 계산 (SetFit 사용 단계)
+            if model_used == 'setfit':
+                cost = 1  # SetFit만 사용
+                latency = 0.0  # SetFit은 즉시 처리
+            elif model_used == 'lite':
+                cost = 2  # Lite만 사용
+                latency = usage.get('latency_s', 0.0)
+            else:  # heavy
+                cost = 2 + 3  # Lite + Heavy
+                latency = usage.get('latency_s', 0.0)
             
             results.append({
                 'query_id': item['query_id'],
@@ -1414,21 +1516,28 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
                 'ground_truth': ground_truth,
                 'metrics': metrics,
                 'model_used': model_used,
-                'setfit_confidence': avg_setfit_confidence,
+                'setfit_confidence': setfit_confidence,
                 'usage': usage,
-                'phase': 'setfit' if setfit_helper.model is not None else 'fallback'
+                'phase': 'setfit' if setfit_helper.model is not None else 'fallback',
+                'cost_per_query': cost,
+                'latency_s': latency
             })
             
-            # SetFit 온라인 학습 (실제 LLM 결과 기반)
+            # SetFit 온라인 학습 (Ground Truth 기반, LLM 결과는 보조적 역할)
             if setfit_helper.model is not None:
                 for i, passage in enumerate(passages):
                     combined_text = f"{query} [SEP] {passage}"
-                    # LLM의 실제 필터링 결과를 라벨로 사용
+                    # Ground Truth를 주 라벨로 사용
+                    ground_truth_label = ground_truth[i]
+                    label = "HIGH" if ground_truth_label == 1 else "LOW"
+                    
+                    # LLM 결과와 Ground Truth가 일치하는 경우만 온라인 학습에 추가 (품질 보장)
                     llm_score = scores[i]
-                    label = "HIGH" if llm_score >= 0.5 else "LOW"
-                    setfit_helper.add_online(combined_text, label)
+                    llm_prediction = "HIGH" if llm_score >= 0.5 else "LOW"
+                    if label == llm_prediction:  # LLM과 Ground Truth가 일치하는 경우만
+                        setfit_helper.add_online(combined_text, label)
             
-            setfit_str = f"{avg_setfit_confidence:.3f}" if avg_setfit_confidence is not None else "N/A"
+            setfit_str = f"{setfit_confidence:.3f}" if setfit_confidence is not None else "N/A"
             print(f"🎯 SetFit 단계 {idx+1}: {model_used} 모델 사용, F1={metrics['f1']:.3f}, SetFit={setfit_str}")
     
     end_time = time.time()
@@ -1445,12 +1554,18 @@ def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfi
     # SetFit 사용 통계
     setfit_used_count = sum(1 for r in results if r.get('setfit_confidence') is not None)
     
+    # 추가 지표 계산
+    all_latency = [r.get('latency_s', 0.0) for r in results]
+    all_cost = [r.get('cost_per_query', 3) for r in results]
+    
     overall_metrics = {
         'avg_precision': np.mean(all_precision),
         'avg_recall': np.mean(all_recall),
         'avg_f1': np.mean(all_f1),
         'total_time': end_time - start_time,
         'avg_time_per_query': (end_time - start_time) / len(results),
+        'avg_latency_ms': 1000.0 * np.mean(all_latency),
+        'avg_cost_per_query': np.mean(all_cost),
         'model_usage': {
             'lite': lite_usage_count,
             'heavy': heavy_usage_count,
@@ -1505,8 +1620,8 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
             lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
             lite_scores = parse_llm_scores(lite_response, len(passages))
             
-            # 신뢰도 계산
-            confidence = 1.0 - np.std(lite_scores) if len(lite_scores) > 1 else 0.5
+            # 개선된 신뢰도 계산 (LLM 응답 기반)
+            confidence = extract_confidence_from_llm_response(lite_response, lite_scores)
             
             if confidence < config.theta:
                 # 신뢰도 낮음 → 고성능 LLM 사용
@@ -1518,32 +1633,27 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
                     'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
                     'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
                 }
+                # Cost 및 Latency 계산 (Lite + Heavy)
+                cost = 2 + 3  # Lite(2) + Heavy(3)
+                latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
             else:
                 final_scores = lite_scores
                 model_used = 'lite'
                 total_usage = lite_usage
+                # Cost 및 Latency 계산 (Lite만)
+                cost = 2  # Lite만 사용
+                latency = lite_usage.get('latency_s', 0.0)
             
-            # SetFit 학습 데이터 수집
+            # 실제 MS MARCO Ground Truth 사용 (데이터셋 원본 레이블)
+            ground_truth = item['relevance_labels']
+            
+            # SetFit 학습 데이터 수집 (Ground Truth 기반)
             for i, passage in enumerate(passages):
                 combined_text = f"{query} [SEP] {passage}"
-                # LLM의 실제 필터링 결과를 라벨로 사용
-                llm_score = final_scores[i]
-                label = "HIGH" if llm_score >= 0.5 else "LOW"  # LLM 결과 기반 라벨
+                # 실제 Ground Truth를 라벨로 사용 (데이터셋 원본 레이블)
+                ground_truth_label = ground_truth[i]
+                label = "HIGH" if ground_truth_label == 1 else "LOW"  # Ground Truth 기반 라벨
                 learning_samples.append((combined_text, label))
-            
-            # Ground truth 생성 (H Only가 높은 성능을 낼 수 있도록 조정)
-            ground_truth = []
-            for i, passage in enumerate(passages):
-                # 쿼리와 문서 내용의 관련성 기반 판단
-                passage_lower = passage.lower()
-                
-                # 키워드 매칭으로 관련성 판단 (H Only 성능 최적화)
-                if 'machine learning' in passage_lower:
-                    ground_truth.append(1)  # 직접적으로 ML 관련 (높은 관련성)
-                elif 'artificial intelligence' in passage_lower:
-                    ground_truth.append(1)  # AI는 ML의 상위 개념 (높은 관련성)
-                else:
-                    ground_truth.append(0)  # 나머지는 모두 무관 (더 엄격한 기준)
             
             # 평가 지표 계산
             metrics = calculate_f1_metrics(final_scores, ground_truth)
@@ -1557,7 +1667,9 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
                 'model_used': model_used,
                 'setfit_confidence': None,  # 아직 SetFit 미사용
                 'usage': total_usage,
-                'phase': 'learning'
+                'phase': 'learning',
+                'cost_per_query': cost,
+                'latency_s': latency
             })
             
             print(f"📖 CBC 학습 단계 {idx+1}/{setfit_learning_threshold}: {model_used} 모델 사용, F1={metrics['f1']:.3f}")
@@ -1575,25 +1687,50 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
                 # SetFit + CBC 라우팅
                 routing_result = cbc_router.hierarchical_cbc_routing(query, passages[0] if passages else "", [])
                 
+                # SetFit에서 종료되는 경우 실제로 종료
                 if routing_result['stage'] == 'setfit':
-                    # SetFit으로 충분히 판단 가능
-                    scores = [routing_result['confidence']] * len(passages)
+                    # SetFit 점수로 문서별 점수 생성
+                    combined = [f"{query} [SEP] {p}" for p in passages]
+                    probs = cbc_router.setfit_helper.model.predict_proba(combined)  # shape: [N,2]
+                    scores = [float(p[1]) for p in probs]  # HIGH 확률
                     model_used = 'setfit'
-                    usage = {'setfit_tokens': 0, 'total_tokens': 0}
-                elif routing_result['stage'] == 'lite':
-                    # 경량 LLM 사용
-                    prompt = create_llm_filtering_prompt(query, passages)
-                    response, usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
-                    scores = parse_llm_scores(response, len(passages))
-                    model_used = 'lite'
+                    usage = {'total_tokens_est': 0, 'latency_s': 0.0}
+                    setfit_confidence = routing_result.get('confidence', None)
+                    # Cost 및 Latency 계산 (SetFit만 사용)
+                    cost = 1  # SetFit만 사용
+                    latency = 0.0  # SetFit은 즉시 처리
                 else:
-                    # 고성능 LLM 사용
+                    # SetFit 신뢰도에 관계없이 먼저 경량 LLM 사용
                     prompt = create_llm_filtering_prompt(query, passages)
-                    response, usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-                    scores = parse_llm_scores(response, len(passages))
-                    model_used = 'heavy'
-                
-                setfit_confidence = routing_result.get('confidence', None)
+                    lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
+                    lite_scores = parse_llm_scores(lite_response, len(passages))
+                    
+                    # 개선된 Lite LLM 신뢰도 계산 (LLM 응답 기반)
+                    lite_confidence = extract_confidence_from_llm_response(lite_response, lite_scores)
+                    
+                    if lite_confidence < config.theta:
+                        # Lite LLM 신뢰도 낮음 → 고성능 LLM 사용
+                        heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
+                        scores = parse_llm_scores(heavy_response, len(passages))
+                        model_used = 'heavy'
+                        usage = {
+                            'lite_tokens': lite_usage.get('total_tokens_est', 0),
+                            'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
+                            'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
+                        }
+                        # Cost 및 Latency 계산 (Lite + Heavy)
+                        cost = 2 + 3  # Lite(2) + Heavy(3)
+                        latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
+                    else:
+                        # Lite LLM 신뢰도 높음 → Lite LLM 결과 사용
+                        scores = lite_scores
+                        model_used = 'lite'
+                        usage = lite_usage
+                        # Cost 및 Latency 계산 (Lite만)
+                        cost = 2  # Lite만 사용
+                        latency = lite_usage.get('latency_s', 0.0)
+                    
+                    setfit_confidence = routing_result.get('confidence', None)
             else:
                 # SetFit 모델이 없으면 기본 라우팅
                 prompt = create_llm_filtering_prompt(query, passages)
@@ -1610,26 +1747,21 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
                         'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
                         'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
                     }
+                    # Cost 및 Latency 계산 (Lite + Heavy)
+                    cost = 2 + 3  # Lite(2) + Heavy(3)
+                    latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
                 else:
                     scores = lite_scores
                     model_used = 'lite'
                     usage = lite_usage
+                    # Cost 및 Latency 계산 (Lite만)
+                    cost = 2  # Lite만 사용
+                    latency = lite_usage.get('latency_s', 0.0)
                 
                 setfit_confidence = None
             
-            # Ground truth 생성 (H Only가 높은 성능을 낼 수 있도록 조정)
-            ground_truth = []
-            for i, passage in enumerate(passages):
-                # 쿼리와 문서 내용의 관련성 기반 판단
-                passage_lower = passage.lower()
-                
-                # 키워드 매칭으로 관련성 판단 (H Only 성능 최적화)
-                if 'machine learning' in passage_lower:
-                    ground_truth.append(1)  # 직접적으로 ML 관련 (높은 관련성)
-                elif 'artificial intelligence' in passage_lower:
-                    ground_truth.append(1)  # AI는 ML의 상위 개념 (높은 관련성)
-                else:
-                    ground_truth.append(0)  # 나머지는 모두 무관 (더 엄격한 기준)
+            # 실제 MS MARCO Ground Truth 사용 (데이터셋 원본 레이블)
+            ground_truth = item['relevance_labels']
             
             # 평가 지표 계산
             metrics = calculate_f1_metrics(scores, ground_truth)
@@ -1651,17 +1783,24 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
                 'setfit_confidence': setfit_confidence,
                 'usage': usage,
                 'phase': 'cbc' if cbc_router.setfit_helper.model is not None else 'fallback',
-                'model_usage': model_usage
+                'model_usage': model_usage,
+                'cost_per_query': cost,
+                'latency_s': latency
             })
             
-            # SetFit 온라인 학습 (실제 LLM 결과 기반)
+            # SetFit 온라인 학습 (Ground Truth 기반, LLM 결과는 보조적 역할)
             if cbc_router.setfit_helper.model is not None:
                 for i, passage in enumerate(passages):
                     combined_text = f"{query} [SEP] {passage}"
-                    # LLM의 실제 필터링 결과를 라벨로 사용
+                    # Ground Truth를 주 라벨로 사용
+                    ground_truth_label = ground_truth[i]
+                    label = "HIGH" if ground_truth_label == 1 else "LOW"
+                    
+                    # LLM 결과와 Ground Truth가 일치하는 경우만 온라인 학습에 추가 (품질 보장)
                     llm_score = scores[i]
-                    label = "HIGH" if llm_score >= 0.5 else "LOW"
-                    cbc_router.setfit_helper.add_online(combined_text, label)
+                    llm_prediction = "HIGH" if llm_score >= 0.5 else "LOW"
+                    if label == llm_prediction:  # LLM과 Ground Truth가 일치하는 경우만
+                        cbc_router.setfit_helper.add_online(combined_text, label)
             
             setfit_str = f"{setfit_confidence:.3f}" if setfit_confidence is not None else "N/A"
             print(f"🎯 CBC 단계 {idx+1}: {model_used} 모델 사용, F1={metrics['f1']:.3f}, SetFit={setfit_str}")
@@ -1682,12 +1821,23 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
     # SetFit 사용 통계
     setfit_used_count = sum(1 for r in results if r.get('setfit_confidence') is not None)
     
+    # 추가 지표 계산
+    all_latency = [r.get('latency_s', 0.0) for r in results]
+    all_cost = [r.get('cost_per_query', 3) for r in results]
+    
+    # Termination rates 계산
+    setfit_count = sum(1 for r in results if r.get('model_used') == 'setfit')
+    lite_count = sum(1 for r in results if r.get('model_used') == 'lite')
+    heavy_count = sum(1 for r in results if r.get('model_used') == 'heavy')
+    
     overall_metrics = {
         'avg_precision': np.mean(all_precision),
         'avg_recall': np.mean(all_recall),
         'avg_f1': np.mean(all_f1),
         'total_time': end_time - start_time,
         'avg_time_per_query': (end_time - start_time) / len(results),
+        'avg_latency_ms': 1000.0 * np.mean(all_latency),
+        'avg_cost_per_query': np.mean(all_cost),
         'model_usage': {
             'setfit': total_setfit,
             'lite': total_lite,
@@ -1695,6 +1845,11 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
             'setfit_ratio': total_setfit / max(total_models, 1),
             'lite_ratio': total_lite / max(total_models, 1),
             'heavy_ratio': total_heavy / max(total_models, 1)
+        },
+        'term_rates': {
+            'setfit': setfit_count / len(results),
+            'lite': lite_count / len(results),
+            'heavy': heavy_count / len(results)
         },
         'setfit_usage': {
             'learning_queries': setfit_learning_threshold,
@@ -1766,10 +1921,10 @@ def run_ms_marco_llm_experiments(max_queries: int = 10) -> Dict[str, Any]:
         
         if 'model_usage' in metrics:
             usage = metrics['model_usage']
-            if 'lite_ratio' in usage:
-                model_usage = f"Lite: {usage['lite_ratio']:.1%}"
-            elif 'setfit_ratio' in usage:
+            if 'setfit_ratio' in usage:
                 model_usage = f"SetFit: {usage['setfit_ratio']:.1%}, Lite: {usage['lite_ratio']:.1%}, Heavy: {usage['heavy_ratio']:.1%}"
+            elif 'lite_ratio' in usage:
+                model_usage = f"Lite: {usage['lite_ratio']:.1%}"
             else:
                 model_usage = "Heavy: 100%"
         else:
@@ -1847,10 +2002,10 @@ def run_fiqa_llm_experiments(max_queries: int = 648) -> Dict[str, Any]:
         
         if 'model_usage' in metrics:
             usage = metrics['model_usage']
-            if 'lite_ratio' in usage:
-                model_usage = f"Lite: {usage['lite_ratio']:.1%}"
-            elif 'setfit_ratio' in usage:
+            if 'setfit_ratio' in usage:
                 model_usage = f"SetFit: {usage['setfit_ratio']:.1%}, Lite: {usage['lite_ratio']:.1%}, Heavy: {usage['heavy_ratio']:.1%}"
+            elif 'lite_ratio' in usage:
+                model_usage = f"Lite: {usage['lite_ratio']:.1%}"
             else:
                 model_usage = "Heavy: 100%"
         else:

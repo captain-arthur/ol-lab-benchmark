@@ -8,18 +8,25 @@ run_llm_ms_marco.py
 
 import sys
 import os
+import argparse
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from filter.llm.llm_filter import run_ms_marco_llm_experiments
 
 def main():
     """MS MARCO LLM 실험 실행"""
+    parser = argparse.ArgumentParser(description='MS MARCO LLM Filtering Experiments')
+    parser.add_argument('--max_queries', type=int, default=20, help='Maximum number of queries to process (default: 20)')
+    
+    args = parser.parse_args()
+    
     print("🚀 MS MARCO LLM Filtering Experiments")
     print("=" * 60)
+    print(f"📊 Processing {args.max_queries} queries")
     
     try:
-        # MS MARCO 실험 실행 (10개 쿼리로 빠른 테스트)
-        results = run_ms_marco_llm_experiments(max_queries=10)
+        # MS MARCO 실험 실행
+        results = run_ms_marco_llm_experiments(max_queries=args.max_queries)
         
         if results:
             print("\n✅ MS MARCO LLM 실험 완료!")

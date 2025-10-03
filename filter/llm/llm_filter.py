@@ -3,990 +3,230 @@
 
 """
 llm_filter.py
-- LLM 기반 필터링 실험을 위한 공통 모듈
-- MS MARCO와 FiQA 데이터셋에 대한 4가지 LLM 실험 방식 구현
-- ① Large-scale LLM Only (Baseline)
-- ② Large-scale LLM + Lightweight LLM  
-- ③ Large-scale LLM + Lightweight LLM + SetFit
-- ④ Large-scale LLM + Lightweight LLM + SetFit + CBC (Proposed)
+- LLM 기반 필터링 실험을 위한 핵심 모듈
+- 4가지 실험 방식 비교: LLM Only, LLM+SDE, LLM+CBC, LLM+SDE+CBC
+- MS MARCO 데이터셋 기반 유사도 점수 평가
 """
 
 import os
 import json
 import time
-import math
-import random
-import pathlib
 import hashlib
 import re
-from collections import Counter, defaultdict
+import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from collections import defaultdict
+from tqdm import tqdm
 
-# ===== Output: force line-buffered + optional tqdm =====
+# ===== Output: force line-buffered =====
+import sys
 try:
-    import sys
-    # Python 3.7+ 에서 라인 단위로 바로바로 flush
     sys.stdout.reconfigure(line_buffering=True)
-except Exception:
+    sys.stderr.reconfigure(line_buffering=True)
+except:
     pass
-
-try:
-    from tqdm.auto import tqdm
-except Exception:
-    tqdm = None
-
-# ===============================
-# Optional imports (graceful)
-# ===============================
-try:
-    from datasets import load_dataset, Dataset
-except Exception:
-    load_dataset = None
-    Dataset = None
-
-try:
-    import requests
-except Exception:
-    requests = None
-
-# SetFit imports (support both old/new APIs)
-SetFitModel = None
-SetFitTrainer = None
-TrainingArguments = None
-try:
-    # Newer API
-    from setfit import SetFitModel, Trainer as SetFitTrainer, TrainingArguments
-except Exception:
-    try:
-        # Older API
-        from setfit import SetFitModel, SetFitTrainer, TrainingArguments
-    except Exception:
-        pass
-
-try:
-    import numpy as np
-except Exception:
-    np = None
-
-try:
-    import torch
-except Exception:
-    torch = None
 
 # ===============================
 # Configuration
 # ===============================
+@dataclass
 class LLMFilterConfig:
-    """LLM 필터링 설정 클래스"""
+    """LLM 필터링 실험 설정"""
     
-    def __init__(self, **kwargs):
         # 기본 설정
-        self.seed = kwargs.get("seed", 42)
-        self.max_queries = kwargs.get("max_queries", 20)
+    max_queries: int = 20
+    max_passages: int = 100
         
-        # 라우팅 임계값
-        self.theta = kwargs.get("theta", 0.8)  # 높은 신뢰도 기준
-        self.warmup_k = kwargs.get("warmup_k", 4)  # SetFit 학습용 최소 쿼리 수
-        self.update_every = kwargs.get("update_every", 3)  # 5 → 3으로 감소
+        # LLM 설정
+    api_mode: str = "ollama"  # "ollama" 또는 "gemini"
+    ollama_url: str = "http://192.168.45.166:11434"
+    model_name: str = "gemma3:latest"
+    temperature: float = 0.0
+    top_p: float = 1.0
         
-        # SetFit 설정 (속도 최적화)
-        self.setfit_mode = kwargs.get("setfit_mode", "both")
-        self.mc_passes = kwargs.get("mc_passes", 5)  # 10 → 5로 감소
-        self.dropout_p = kwargs.get("dropout_p", 0.2)
-        self.setfit_epochs = kwargs.get("setfit_epochs", 1)  # 3 → 1로 감소
-        self.setfit_batch_size = kwargs.get("setfit_batch_size", 4)  # 8 → 4로 감소
-        
-        # Ollama 설정
-        self.ollama_url = kwargs.get("ollama_url", "http://127.0.0.1:11434")
-        self.gemma_lite = kwargs.get("gemma_lite", "gemma:2b")
-        self.gemma_heavy = kwargs.get("gemma_heavy", "gemma3:latest")
-        self.temperature = kwargs.get("temperature", 0.0)
-        self.top_p = kwargs.get("top_p", 1.0)
+        # Gemini API 설정
+    gemini_api_key: Optional[str] = None
+    gemini_model: str = "gemini-2.5-flash"
         
         # 평가 설정
-        self.eval_with_heavy_oracle = kwargs.get("eval_with_heavy_oracle", True)
-
-# ===============================
-# Utilities
-# ===============================
-def set_seed(seed: int = 42):
-    """시드 설정"""
-    random.seed(seed)
-    try:
-        import numpy as _np
-        _np.random.seed(seed)
-    except Exception:
-        pass
-    try:
-        import torch as _t
-        _t.manual_seed(seed)
-        _t.cuda.manual_seed_all(seed)
-    except Exception:
-        pass
-
-def ensure_dir(path: str):
-    """디렉토리 생성"""
-    pathlib.Path(path).mkdir(parents=True, exist_ok=True)
-
-def jdump(obj, path):
-    """JSON 저장"""
-    ensure_dir(os.path.dirname(path))
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-def save_json(obj, path):
-    """JSON 저장 (별칭)"""
-    jdump(obj, path)
-
-def jappend_jsonl(path, rec):
-    """JSONL에 레코드 추가"""
-    ensure_dir(os.path.dirname(path))
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-def normalize_text(s: str) -> str:
-    """텍스트 정규화"""
-    return " ".join((s or "").strip().lower().split())
-
-def nearest_label(pred: str, label_list: List[str]) -> str:
-    """가장 가까운 라벨 찾기"""
-    pred = (pred or "").strip().lower()
-    if not label_list:
-        return pred
-    label_list = [str(l) for l in label_list]
-    import difflib
-    cand = difflib.get_close_matches(pred, label_list, n=1, cutoff=0.0)
-    return cand[0] if cand else label_list[0]
-
-def token_f1_em(pred: str, gold: str) -> Tuple[float, float]:
-    """토큰 F1 및 Exact Match 계산"""
-    p = normalize_text(pred).split()
-    g = normalize_text(gold).split()
-    em = 1.0 if p == g else 0.0
-    if not p and not g:
-        return 1.0, em
-    inter = Counter(p) & Counter(g)
-    tp = sum(inter.values())
-    if tp == 0:
-        return 0.0, em
-    prec = tp / max(1, len(p))
-    rec = tp / max(1, len(g))
-    f1 = 2 * prec * rec / max(1e-9, (prec + rec))
-    return f1, em
-
-# ===============================
-# Response Cache
-# ===============================
-class ResponseCache:
-    """Ollama 응답 캐시"""
+    sim_threshold: float = 0.5  # 유사도 임계값
     
-    def __init__(self, path: str):
-        self.path = path
-        ensure_dir(os.path.dirname(path))
-        self.map = {}
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            rec = json.loads(line)
-                            k = rec.get("cache_key")
-                            if k:
-                                self.map[k] = rec
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-    def key(self, model: str, prompt: str) -> str:
-        """캐시 키 생성"""
-        return hashlib.sha256((model + "||" + prompt).encode("utf-8")).hexdigest()[:20]
-
-    def get(self, model: str, prompt: str) -> Optional[Dict[str, Any]]:
-        """캐시에서 응답 가져오기"""
-        return self.map.get(self.key(model, prompt))
-
-    def put(self, model: str, prompt: str, text: str, usage: Dict[str, Any]):
-        """캐시에 응답 저장"""
-        rec = {
-            "cache_key": self.key(model, prompt),
-            "model": model,
-            "prompt": prompt,
-            "text": text,
-            "usage": usage,
-        }
-        jappend_jsonl(self.path, rec)
-        self.map[rec["cache_key"]] = rec
+    # SDE 설정
+    sde_k: int = 3  # 확장 쿼리 개수
+    
+    # CBC 설정
+    cbc_enabled: bool = False
+    cbc_cache_path: str = ".cache/cbc_stats.json"
+    
+    # 캐시 설정
+    cache_dir: str = ".cache"
+    results_dir: str = "results/llm/ms_marco"
 
 # ===============================
-# Ollama Client
+# LLM Client Classes
 # ===============================
 class Ollama:
     """Ollama 클라이언트"""
-    
-    def __init__(self, base_url="http://192.168.45.166:11434", temperature=0.0, top_p=1.0, seed=42):
-        if requests is None:
-            raise RuntimeError("`requests` not installed. Please `pip install requests`.")
-        self.base_url = base_url
+    def __init__(self, url: str, temperature: float = 0.0, top_p: float = 1.0):
+        self.url = url.rstrip('/')
         self.temperature = temperature
         self.top_p = top_p
-        self.seed = seed
 
-    def generate(self, model: str, prompt: str, system: Optional[str] = None) -> Dict[str, Any]:
+    def generate(self, model: str, prompt: str, **kwargs) -> str:
         """텍스트 생성"""
+        try:
+            import requests
+            
         payload = {
             "model": model,
             "prompt": prompt,
+                "stream": False,
+                "options": {
             "temperature": self.temperature,
             "top_p": self.top_p,
-            "stream": False,
-            "seed": self.seed,
-        }
-        if system:
-            payload["system"] = system
-        t0 = time.time()
-        r = requests.post(f"{self.base_url}/api/generate",
-                          headers={"Content-Type":"application/json"},
-                          data=json.dumps(payload), timeout=600)
-        lat = time.time()-t0
-        if r.status_code != 200:
-            raise RuntimeError(f"Ollama error {r.status_code}: {r.text[:200]}")
-        out = r.json()
-        usage = {
-            "latency_s": lat,
-            "eval_count": out.get("eval_count"),
-            "prompt_eval_count": out.get("prompt_eval_count"),
-            "total_tokens_est": (out.get("eval_count") or 0) + (out.get("prompt_eval_count") or 0),
-        }
-        return {"text": out.get("response",""), "usage": usage}
+                }
+            }
+            payload.update(kwargs)
+            
+            response = requests.post(f"{self.url}/api/generate", json=payload, timeout=120)
+            response.raise_for_status()
+            
+            result = response.json()
+            return result.get("response", "").strip()
+            
+        except Exception as e:
+            print(f"❌ Ollama API 오류: {e}")
+            return ""
+
+class GeminiAPI:
+    """Google Gemini API 클라이언트"""
+    def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash", temperature: float = 0.0):
+        self.api_key = api_key
+        self.model_name = model_name
+        self.temperature = temperature
+    
+    def generate(self, prompt: str, **kwargs) -> str:
+        """텍스트 생성"""
+        try:
+            import google.generativeai as genai
+            
+            genai.configure(api_key=self.api_key)
+            model = genai.GenerativeModel(self.model_name)
+            
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=self.temperature,
+                )
+            )
+            
+            return response.text.strip()
+            
+        except Exception as e:
+            print(f"❌ Gemini API 오류: {e}")
+            return ""
 
 # ===============================
-# Task-specific Prompts
+# Cache Management
 # ===============================
-def prompt_banking77(text: str, labels: List[str]) -> str:
-    """Banking77 프롬프트"""
-    head = "Banking77 프롬프트\n\n" \
-           "Banking customer service intent classification task.\n" \
-           "Classify the customer's intent from the given text.\n" \
-           "Answer with EXACTLY ONE label from the list below.\n" \
-           "Your answer MUST be exactly one label from the list, character-perfect.\n" \
-           "Be precise and accurate in your classification.\n" \
-           "Respond with the label ONLY. No extra words.\n\n"
-    label_hint = ", ".join(labels[:20]) + (", ..." if len(labels) > 20 else "")
-    return f"""{head}Input: {text}
-
-Valid intent labels (choose one): {label_hint}
-Intent:"""
-
-def prompt_clinc150(text: str, labels: List[str]) -> str:
-    """CLINC150 프롬프트"""
-    head = "CLINC150 프롬프트\n\n"
-    label_text = ", ".join(sorted(list(set(labels))))
+class ResponseCache:
+    """LLM 응답 캐시 관리"""
     
-    return f"""{head}User Query: {text}
-
-Available Intent IDs: {label_text}
-
-Instructions:
-- Return ONLY the intent ID number (0-{len(labels)-1})
-- Do not include any other text or explanation
-- If unsure, choose the most likely intent ID
-- Be precise and accurate in your classification
-- Consider the context and specific keywords in the query
-
-Examples:
-- "how to say hello in french" → 0 (translation)
-- "transfer money to my savings" → 1 (banking)
-- "set a timer for 10 minutes" → 2 (timer)
-
-Intent ID:"""
-
-def prompt_stsb(text_block: str) -> str:
-    """STS-B 프롬프트"""
-    head = "STS-B 프롬프트\n\n" \
-           "Semantic Textual Similarity (STS-B) task.\n" \
-           "Compare the similarity between two sentences and output a single integer from 0 to 5.\n\n" \
-           "Scoring Guide:\n" \
-           "0 = completely different meanings\n" \
-           "1 = mostly different meanings\n" \
-           "2 = somewhat different meanings\n" \
-           "3 = somewhat similar meanings\n" \
-           "4 = mostly similar meanings\n" \
-           "5 = identical or very similar meanings\n\n" \
-           "Examples:\n" \
-           "- 'A cat is sleeping' vs 'A dog is running' → 0\n" \
-           "- 'A woman is cooking' vs 'A man is cooking' → 3\n" \
-           "- 'A man is playing guitar' vs 'A man is playing the guitar' → 5\n" \
-           "- 'A girl is styling her hair' vs 'A girl is brushing her hair' → 2\n" \
-           "- 'A group of men play soccer' vs 'A group of boys are playing soccer' → 4\n\n" \
-           "Output ONLY the number (0-5):\n\n"
-    return f"""{head}{text_block}
-
-Score:"""
-
-# ===============================
-# Confidence Extraction
-# ===============================
-def extract_confidence_simple(response: str, base: float = 0.65) -> float:
-    """신뢰도 추출 로직"""
-    response_lower = (response or "").lower().strip()
+    def __init__(self, cache_path: str):
+        self.cache_path = cache_path
+        self.cache = self._load_cache()
     
-    # 확실한 표현들 (높은 신뢰도)
-    confident_indicators = [
-        "확실", "certain", "definitely", "absolutely", "clearly",
-        "분명", "obviously", "without doubt", "no doubt", "strongly", "100%",
-        "정확", "exact", "precise", "perfect", "correct"
-    ]
-    
-    # 중간 신뢰도 표현들
-    moderate_indicators = [
-        "아마", "probably", "likely", "seems", "appears",
-        "보통", "usually", "typically", "generally"
-    ]
-    
-    # 불확실한 표현들 (낮은 신뢰도)
-    uncertain_indicators = [
-        "모르", "not sure", "uncertain", "unclear", "might be", "guess",
-        "maybe", "perhaps", "possibly", "could be", "might"
-    ]
-    
-    # 확실한 표현 체크
-    for indicator in confident_indicators:
-        if indicator in response_lower:
-            return 0.9
-    
-    # 중간 신뢰도 표현 체크
-    for indicator in moderate_indicators:
-        if indicator in response_lower:
-            return 0.7
-    
-    # 불확실한 표현 체크
-    for indicator in uncertain_indicators:
-        if indicator in response_lower:
-            return 0.4
-    
-    return base
-
-def extract_confidence_from_llm_response(response: str, scores: List[float]) -> float:
-    """LLM 응답에서 confidence 메타정보 파싱 또는 softmax-normalized score 기반 계산"""
-    import re
-    
-    # 1. LLM 응답에서 명시적 confidence 값 파싱 시도
-    confidence_patterns = [
-        r'confidence[:\s]*([0-9.]+)',
-        r'신뢰도[:\s]*([0-9.]+)',
-        r'확신도[:\s]*([0-9.]+)',
-        r'certainty[:\s]*([0-9.]+)',
-        r'([0-9.]+)\s*%?\s*confidence',
-        r'([0-9.]+)\s*%?\s*신뢰도'
-    ]
-    
-    for pattern in confidence_patterns:
-        match = re.search(pattern, response, re.IGNORECASE)
-        if match:
+    def _load_cache(self) -> Dict[str, str]:
+        """캐시 로드"""
+        if os.path.exists(self.cache_path):
             try:
-                conf_value = float(match.group(1))
-                # 0-1 범위로 정규화
-                if conf_value > 1.0:
-                    conf_value = conf_value / 100.0
-                return max(0.0, min(1.0, conf_value))
-            except ValueError:
-                continue
+                cache = {}
+                with open(self.cache_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.strip():
+                            item = json.loads(line.strip())
+                            cache[item['key']] = item['response']
+                return cache
+            except:
+                return {}
+        return {}
     
-    # 2. 점수 분포 기반 confidence 계산 (softmax-normalized)
-    if scores and len(scores) > 1:
-        try:
-            import numpy as np
-            # Softmax 정규화
-            exp_scores = np.exp(np.array(scores))
-            softmax_scores = exp_scores / np.sum(exp_scores)
-            
-            # 최대 확률과 엔트로피 기반 confidence
-            max_prob = np.max(softmax_scores)
-            entropy = -np.sum(softmax_scores * np.log(softmax_scores + 1e-9))
-            max_entropy = np.log(len(scores))
-            normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
-            
-            # 높은 최대 확률 + 낮은 엔트로피 = 높은 confidence
-            confidence = max_prob * (1 - normalized_entropy)
-            return max(0.0, min(1.0, confidence))
-        except Exception:
-            pass
+    def _save_cache(self):
+        """캐시 저장"""
+        os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+        with open(self.cache_path, 'w', encoding='utf-8') as f:
+            for key, response in self.cache.items():
+                item = {'key': key, 'response': response}
+                json.dump(item, f, ensure_ascii=False)
+                f.write('\n')
     
-    # 3. 점수 분산 기반 confidence (기존 방식 개선)
-    if scores and len(scores) > 1:
-        try:
-            import numpy as np
-            # 표준편차 대신 변동계수 사용 (더 정규화된 지표)
-            mean_score = np.mean(scores)
-            std_score = np.std(scores)
-            if mean_score > 0:
-                cv = std_score / mean_score  # 변동계수
-                confidence = 1.0 / (1.0 + cv)  # 변동계수가 낮을수록 높은 confidence
-                return max(0.0, min(1.0, confidence))
-        except Exception:
-            pass
+    def get(self, key: str) -> Optional[str]:
+        """캐시에서 조회"""
+        return self.cache.get(key)
     
-    # 4. 기본값 반환
-    return 0.65
+    def set(self, key: str, response: str):
+        """캐시에 저장"""
+        self.cache[key] = response
+        self._save_cache()
 
-# ===============================
-# Task-specific Predictors
-# ===============================
-def ollama_cached_call(client: Ollama, cache: ResponseCache, model: str, prompt: str) -> Tuple[str, Dict[str,Any]]:
-    """캐시된 Ollama 호출"""
-    k = cache.get(model, prompt)
-    if k:
-        return k["text"], k["usage"]
-    resp = client.generate(model, prompt)
-    text, usage = resp["text"], resp["usage"]
-    cache.put(model, prompt, text, usage)
-    return text, usage
-
-def parse_label_only(text: str) -> str:
-    """라벨만 파싱"""
-    line = (text or "").strip().splitlines()[0]
-    line = re.sub(r'^[\s"\']+|[\s"\']+$', '', line)
-    m = re.match(r'^([A-Za-z0-9_\-\.]+)$', line)
-    return m.group(1) if m else line.strip()
-
-def predict_banking77(client: Ollama, cache: ResponseCache, model: str, text: str, labels: List[str]) -> Tuple[str, float, Dict[str,Any], str]:
-    """Banking77 예측"""
-    prompt = prompt_banking77(text, labels)
-    out, usage = ollama_cached_call(client, cache, model, prompt)
-    raw = parse_label_only(out)
-    lab = nearest_label(raw, labels)
-    conf = extract_confidence_simple(out, base=0.70 if raw == lab else 0.60)
-    return lab, conf, usage, out
-
-def predict_clinc150(client: Ollama, cache: ResponseCache, model: str, text: str, labels: List[str]) -> Tuple[str, float, Dict[str,Any], str]:
-    """CLINC150 예측"""
-    prompt = prompt_clinc150(text, labels)
-    out, usage = ollama_cached_call(client, cache, model, prompt)
+class CBCStats:
+    """CBC 통계 관리"""
     
-    lab = None
+    def __init__(self, cache_path: str):
+        self.cache_path = cache_path
+        self.stats = self._load_stats()
     
-    # 1. 정확한 숫자 매칭 (0-149 범위)
-    m = re.search(r'\b([0-9]|[1-9][0-9]|1[0-4][0-9])\b', out)
-    if m:
-        raw = m.group(1)
-        if raw.isdigit():
-            idx = int(raw)
-            if 0 <= idx < len(labels):
-                lab = str(idx)
+    def _load_stats(self) -> Dict[str, List[float]]:
+        """통계 로드"""
+        if os.path.exists(self.cache_path):
+            try:
+                with open(self.cache_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                return {'overlap': [], 'margin': []}
+        return {'overlap': [], 'margin': []}
     
-    # 2. 라벨 텍스트 직접 매칭
-    if lab is None:
-        raw = parse_label_only(out)
-        lab = nearest_label(raw, labels)
+    def _save_stats(self):
+        """통계 저장"""
+        os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+        with open(self.cache_path, 'w', encoding='utf-8') as f:
+            json.dump(self.stats, f, ensure_ascii=False, indent=2)
     
-    # 3. 범위 클리핑 (안전장치)
-    if lab is None or not lab.isdigit():
-        lab = "0"  # 기본값
-    else:
-        idx = int(lab)
-        if idx >= len(labels):
-            idx = idx % len(labels)
-        lab = str(idx)
+    def update(self, overlap: float, margin: float):
+        """통계 업데이트"""
+        self.stats['overlap'].append(overlap)
+        self.stats['margin'].append(margin)
+        self._save_stats()
     
-    # 신뢰도 계산
-    raw_matched = m.group(1) if m else parse_label_only(out)
-    conf = extract_confidence_simple(out, base=0.75 if raw_matched == lab else 0.55)
-    
-    return lab, conf, usage, out
-
-def predict_stsb(client: Ollama, cache: ResponseCache, model: str, text_block: str) -> Tuple[str, float, Dict[str,Any], str]:
-    """STS-B 예측"""
-    prompt = prompt_stsb(text_block)
-    out, usage = ollama_cached_call(client, cache, model, prompt)
-    
-    lab = None
-    
-    # 1. 모든 숫자 추출
-    all_nums = re.findall(r'\b(\d+)\b', out)
-    
-    if all_nums:
-        # 2. 0-5 범위 내 숫자 필터링
-        valid_nums = [int(x) for x in all_nums if 0 <= int(x) <= 5]
-        
-        if valid_nums:
-            lab = str(valid_nums[0])
-        else:
-            # 4. 범위를 벗어난 숫자 정규화
-            max_num = max(int(x) for x in all_nums)
-            if max_num > 0:
-                normalized = int(round(5 * int(all_nums[0]) / max_num))
-                lab = str(max(0, min(5, normalized)))
-            else:
-                lab = "3"
-    else:
-        # 5. 숫자가 없으면 키워드 기반 추정
-        out_lower = out.lower()
-        if any(word in out_lower for word in ['identical', 'same', 'exact', 'perfect']):
-            lab = "5"
-        elif any(word in out_lower for word in ['very similar', 'mostly similar', 'almost same']):
-            lab = "4"
-        elif any(word in out_lower for word in ['somewhat similar', 'moderately similar']):
-            lab = "3"
-        elif any(word in out_lower for word in ['somewhat different', 'moderately different']):
-            lab = "2"
-        elif any(word in out_lower for word in ['very different', 'mostly different']):
-            lab = "1"
-        elif any(word in out_lower for word in ['completely different', 'totally different', 'unrelated']):
-            lab = "0"
-        else:
-            lab = "3"  # 기본값
-    
-    # 신뢰도 계산
-    if lab in ["0", "1", "2", "3", "4", "5"]:
-        conf = extract_confidence_simple(out, base=0.80)
-    else:
-        conf = extract_confidence_simple(out, base=0.50)
-    
-    return lab, conf, usage, out
-
-def predict_task(client: Ollama, cache: ResponseCache, model: str, meta: Dict[str, Any], text: str) -> Tuple[str, float, Dict[str,Any], str]:
-    """태스크별 예측"""
-    name = meta["name"]
-    labels = meta.get("labels", [])
-    
-    if name == "banking77":
-        return predict_banking77(client, cache, model, text, labels)
-    elif name == "clinc150":
-        return predict_clinc150(client, cache, model, text, labels)
-    elif name == "stsb":
-        return predict_stsb(client, cache, model, text)
-    else:
-        # generic classifier
-        prompt = "Return exactly one label from this list. Label only.\n" \
-                 f"Input: {text}\nLabels: {', '.join(labels[:30])}\nLabel:"
-        out, usage = ollama_cached_call(client, cache, model, prompt)
-        raw = parse_label_only(out)
-        lab = nearest_label(raw, labels)
-        conf = extract_confidence_simple(out, base=0.65)
-        return lab, conf, usage, out
-
-# ===============================
-# SetFit Helper
-# ===============================
-class SetFitHelper:
-    """SetFit 헬퍼 클래스"""
-    
-    def __init__(self):
-        self.enabled = (SetFitModel is not None and SetFitTrainer is not None and 
-                        TrainingArguments is not None and Dataset is not None and torch is not None and np is not None)
-        self.model = None
-        self.label2id = {"LOW":0, "HIGH":1}
-        self.id2label = {0:"LOW", 1:"HIGH"}
-        self.bufX, self.bufY = [], []
-
-    def _args_safe(self, epochs=3, batch_size=16, num_iterations=None):
-        if TrainingArguments is None:
-            raise RuntimeError("TrainingArguments unavailable")
-        kwargs = {"num_epochs": epochs, "batch_size": batch_size}
-        if num_iterations is not None:
-            try: 
-                kwargs["num_iterations"] = num_iterations
-            except Exception: 
-                pass
-        return TrainingArguments(**kwargs)
-
-    def warmup(self, texts: List[str], labels: List[str]):
-        if not (self.enabled and texts):
-            return
-        
-        if len(texts) < 2:
-            print(f"[SetFit] Warmup skipped: insufficient samples ({len(texts)})")
-            return
-        
-        unique_labels = set(labels)
-        if len(unique_labels) < 2:
-            print(f"[SetFit] Warmup skipped: insufficient label diversity ({len(unique_labels)})")
-            self.model = None
-            return
-        
-        try:
-            y = []
-            for l in labels:
-                if l in self.label2id:
-                    y.append(self.label2id[l])
-                else:
-                    y.append(0)
-            
-            ds = Dataset.from_dict({"text": texts, "label": y})
-            self.model = SetFitModel.from_pretrained("sentence-transformers/paraphrase-mpnet-base-v2")
-            args = self._args_safe(epochs=3, batch_size=min(16, len(texts)), num_iterations=20)
-            trainer = SetFitTrainer(model=self.model, args=args, train_dataset=ds, column_mapping={"text":"text","label":"label"})
-            trainer.train()
-            print(f"[SetFit] Warmup OK ({len(texts)} samples, {len(unique_labels)} labels)")
-        except Exception as e:
-            print(f"[SetFit] Warmup failed: {e}")
-            self.model = None
-
-    def predict_conf(self, text: str) -> Tuple[Optional[str], float]:
-        if not self.enabled:
-            return None, 0.0
-        
-        if self.model is None:
-            return "HIGH", 0.8
-        
-        try:
-            p = self.model.predict_proba([text])[0]
-            p_high = float(p[1]) if len(p) > 1 else 0.0
-            return ("HIGH" if p_high >= 0.5 else "LOW"), p_high
-        except Exception as e:
-            print(f"[SetFit] predict_conf failed: {e}")
-            return None, 0.0
-
-    def add_online(self, x: str, y: str):
-        if not (self.enabled and self.model is not None):
-            return
-        self.bufX.append(x)
-        self.bufY.append(y)
-        if len(self.bufX) >= 5:  # UPDATE_EVERY
-            self._flush()
-
-    def _flush(self):
-        if not self.bufX: 
-            return
-        try:
-            y = []
-            for l in self.bufY:
-                if l in self.label2id:
-                    y.append(self.label2id[l])
-                elif l.upper() in self.label2id:
-                    y.append(self.label2id[l.upper()])
-                elif any(key.lower() in l.lower() for key in self.label2id.keys()):
-                    for key in self.label2id.keys():
-                        if key.lower() in l.lower():
-                            y.append(self.label2id[key])
-                            break
-                else:
-                    y.append(0)
-            
-            if len(self.bufX) < 2:
-                return
-                
-            ds = Dataset.from_dict({"text": self.bufX, "label": y})
-            args = self._args_safe(epochs=1, batch_size=min(4, len(self.bufX)), num_iterations=3)
-            trainer = SetFitTrainer(model=self.model, args=args, train_dataset=ds, column_mapping={"text":"text","label":"label"})
-            trainer.train()
-            print(f"[SetFit] Online mini-fit ({len(self.bufX)} samples)")
-        except Exception as e:
-            print(f"[SetFit] Online update failed: {e}")
-        finally:
-            self.bufX, self.bufY = [], []
-
-# ===============================
-# Evaluation Metrics
-# ===============================
-
-
-
-# ===============================
-# CBC Router for Batch-based Routing
-# ===============================
-class CBCRouter:
-    """CBC 기반 배치 라우팅 시스템"""
-    
-    def __init__(self, config: LLMFilterConfig):
-        self.config = config
-        self.batch_scores = {
-            'setfit': [],
-            'lite': [],
-            'heavy': []
-        }
-        self.dynamic_thresholds = {}
-        self.ollama = Ollama()
-        self.cache = ResponseCache(".cache/cbc_cache.jsonl")
-        self.setfit_helper = SetFitHelper()
-        self.percentile_threshold = 95 # 기본값
-        self.min_threshold = 0.6 # 기본값
-        self.calibration_mode = "dynamic" # 기본값
-        
-        # SetFit 초기화 추가
-        self._initialize_setfit()
-    
-    def _initialize_setfit(self):
-        """SetFit 초기 학습"""
-        try:
-            # 간단한 훈련 데이터로 warmup
-            train_texts = [
-                "계좌 잔액 [SEP] 잔액이 얼마인가요?",
-                "이체 요청 [SEP] 돈을 보내주세요",
-                "카드 한도 [SEP] 카드 한도가 얼마인가요?",
-                "대출 신청 [SEP] 대출을 받고 싶습니다",
-                "환율 조회 [SEP] 현재 환율이 어떻게 되나요?",
-                "무관한 질문 [SEP] 오늘 날씨가 어때요?",
-                "영화 추천 [SEP] 재미있는 영화 알려주세요",
-                "요리 방법 [SEP] 김치찌개 만드는 법 알려주세요"
-            ]
-            train_labels = ["HIGH", "HIGH", "HIGH", "HIGH", "HIGH", "LOW", "LOW", "LOW"]
-            
-            print("🔄 Initializing SetFit with warmup data...")
-            self.setfit_helper.warmup(train_texts, train_labels)
-            print("✅ SetFit warmup completed successfully")
-            
-        except Exception as e:
-            print(f"⚠️ SetFit warmup failed: {e}")
-            print("⚠️ SetFit will use default predictions")
-    
-    
-    def cbc_decision(self, score: float, percentile: int) -> bool:
-        """CBC 기반 라우팅 결정"""
-        try:
-            # 현재 배치의 점수 분포에서 임계값 계산
-            if not self.batch_scores['setfit']:
-                return score >= 0.7  # 기본 임계값
-            
-            threshold = np.percentile(self.batch_scores['setfit'], percentile)
-            return score >= threshold
-            
-        except Exception as e:
-            print(f"⚠️ CBC decision failed: {e}")
-            return score >= 0.7  # 기본 임계값
-    
-    
-    def process_batch_cbc_with_anchors(self, batch_data: List[Tuple[str, str, Dict[str, Any]]], anchors_dict: Dict[str, List[str]] = None) -> List[Dict[str, Any]]:
-        """CBC + 앵커 기반 배치 처리"""
-        results = []
-        
-        # 모든 샘플의 신뢰도 점수 수집
-        for query, text, meta in batch_data:
-            anchors = anchors_dict.get(query, []) if anchors_dict else []
-            
-            # 앵커 기반 신뢰도 계산
-            confidence_score = self.calculate_anchor_based_confidence(query, text, anchors)
-            
-            self.batch_scores['setfit'].append(confidence_score)
-            
-            # 계층적 CBC 라우팅 수행
-            routing_result = self.hierarchical_cbc_routing(query, text, anchors)
-            
-            results.append({
-                'query': query,
-                'text': text,
-                'meta': meta,
-                'anchors': anchors,
-                'setfit_confidence': confidence_score,
-                'routing_decision': routing_result
-            })
-        
-        return results
-    
-    
-    def _predict_with_model(self, model: str, query: str, text: str, meta: Dict[str, Any]) -> Dict[str, Any]:
-        """지정된 모델로 예측 수행"""
-        task_name = meta.get("name", "generic")
-        
-        if task_name == "banking77":
-            label, confidence, usage, raw = predict_banking77(
-                self.ollama, self.cache, model, text, meta.get("labels", [])
-            )
-        elif task_name == "clinc150":
-            label, confidence, usage, raw = predict_clinc150(
-                self.ollama, self.cache, model, text, meta.get("labels", [])
-            )
-        elif task_name == "stsb":
-            label, confidence, usage, raw = predict_stsb(
-                self.ollama, self.cache, model, f"{query} [SEP] {text}"
-            )
-        else:
-            label, confidence, usage, raw = predict_task(
-                self.ollama, self.cache, model, meta, text
-            )
-        
-        return {
-            'label': label,
-            'confidence': confidence,
-            'usage': usage,
-            'raw': raw
-        }
-    
-    
-    def _calculate_dynamic_thresholds(self):
-        """점수 분포 기반으로 동적 임계값 계산 (CBC 핵심)"""
-        if not self.batch_scores['setfit']:
-            return
-        
-        # 빈 배열 처리 (안전성 보장)
-        def safe_percentile(scores, percentile):
-            if not scores:
-                return self.min_threshold
-            return np.percentile(scores, percentile)
-        
-        # p95 기반 동적 임계값 계산 (CBC의 핵심)
-        self.dynamic_thresholds = {
-            'setfit': safe_percentile(self.batch_scores['setfit'], self.percentile_threshold),
-            'lite': safe_percentile(self.batch_scores['lite'], self.percentile_threshold),
-            'heavy': safe_percentile(self.batch_scores['heavy'], self.percentile_threshold)
-        }
-        
-        # 최소 임계값 보장 (안정성)
-        self.dynamic_thresholds = {
-            k: max(v, self.min_threshold) for k, v in self.dynamic_thresholds.items()
-        }
-    
-    
-    def get_routing_stats(self) -> Dict[str, Any]:
-        """CBC 라우팅 통계 반환"""
-        if not self.dynamic_thresholds:
-            return {}
-        
-        return {
-            'dynamic_thresholds': self.dynamic_thresholds,
-            'percentile_threshold': self.percentile_threshold,
-            'calibration_mode': self.calibration_mode
-        }
-    
-    
-    def calculate_anchor_based_confidence(self, query: str, text: str, anchors: List[str] = None) -> float:
-        """앵커 기반 향상된 신뢰도 계산 (CBC 핵심)"""
-        try:
-            # 기본 SetFit 예측
-            combined_text = f"{query} [SEP] {text}"
-            
-            if self.setfit_helper.enabled and self.setfit_helper.model is not None:
-                setfit_probs = self.setfit_helper.model.predict_proba([combined_text])[0]
-            else:
-                # SetFit 비활성 시 기본값
-                setfit_probs = np.array([0.5, 0.5])
-            
-            # 기본 특징 계산 (NumPy 호환)
-            if hasattr(setfit_probs, 'numpy'):
-                setfit_probs = setfit_probs.numpy()
-            setfit_probs = np.array(setfit_probs)
-            
-            p_max = np.max(setfit_probs)
-            
-            # 단순화된 점수 계산
-            score = p_max * 0.8 + 0.2  # 기본 신뢰도 + 보너스
-            
-            return np.clip(score, 0.0, 1.0)
-            
-        except Exception as e:
-            print(f"⚠️ Anchor-based confidence calculation failed: {e}")
+    def get_threshold(self, metric: str, percentile: int = 80) -> float:
+        """퍼센타일 기반 임계값 계산"""
+        values = self.stats.get(metric, [])
+        if not values:
             return 0.5  # 기본값
-    
-    
-    
-    
-    def hierarchical_cbc_routing(self, query: str, text: str, anchors: List[str] = None) -> Dict[str, Any]:
-        """계층적 CBC 라우팅 (CBC 핵심) - 실제 배치별 점수 분포 반영"""
-        try:
-            # 1단계: SetFit + 앵커 (비용 최소)
-            setfit_score = self.calculate_anchor_based_confidence(query, text, anchors)
-            
-            # SetFit 점수를 배치에 추가
-            self.batch_scores['setfit'].append(setfit_score)
-            
-            # CBC 기반 동적 임계값 계산
-            setfit_threshold = self._get_dynamic_threshold('setfit', 80)  # 상위 80%
-            
-            if setfit_score >= setfit_threshold:
-                return {
-                    'stage': 'setfit',
-                    'model_used': 'setfit',
-                    'confidence': setfit_score,
-                    'decision': 'accept',
-                    'threshold_used': setfit_threshold,
-                    'reason': f'SetFit confidence {setfit_score:.3f} >= threshold {setfit_threshold:.3f}'
-                }
-            
-            # 2단계: 경량 LLM (중간 비용)
-            lite_result = self._predict_with_model(self.config.gemma_lite, query, text, {'name': 'generic'})
-            lite_score = lite_result['confidence']
-            
-            # Lite LLM 점수를 배치에 추가
-            self.batch_scores['lite'].append(lite_score)
-            lite_threshold = self._get_dynamic_threshold('lite', 90)  # 상위 90%
-            
-            if lite_score >= lite_threshold:
-                return {
-                    'stage': 'lite',
-                    'model_used': 'lite',
-                    'confidence': lite_score,
-                    'decision': 'accept',
-                    'threshold_used': lite_threshold,
-                    'reason': f'Lite LLM confidence {lite_score:.3f} >= threshold {lite_threshold:.3f}'
-                }
-            
-            # 3단계: 고성능 LLM (최고 비용)
-            heavy_result = self._predict_with_model(self.config.gemma_heavy, query, text, {'name': 'generic'})
-            heavy_score = heavy_result['confidence']
-            
-            # Heavy LLM 점수를 배치에 추가
-            self.batch_scores['heavy'].append(heavy_score)
-            
-            return {
-                'stage': 'heavy',
-                'model_used': 'heavy',
-                'confidence': heavy_score,
-                'decision': 'accept',
-                'threshold_used': 'N/A',
-                'reason': 'Heavy LLM required for low confidence cases'
-            }
-            
-        except Exception as e:
-            return {
-                'stage': 'fallback',
-                'model_used': 'heavy',
-                'confidence': 0.5,
-                'decision': 'accept',
-                'reason': f'Fallback due to error: {e}'
-            }
-    
-    def _get_dynamic_threshold(self, stage: str, percentile: int) -> float:
-        """동적 임계값 계산 (CBC 핵심) - 실제 배치별 점수 분포 반영"""
-        try:
-            if not self.batch_scores or stage not in self.batch_scores:
-                return 0.7  # 기본 임계값
-            
-            stage_scores = self.batch_scores[stage]
-            if not stage_scores:
-                return 0.7
-            
-            # 실제 percentile 계산
-            threshold = np.percentile(stage_scores, percentile)
-            
-            # 최소 임계값 보장 (안정성)
-            min_threshold = 0.6
-            return max(threshold, min_threshold)
-            
-        except Exception as e:
-            print(f"⚠️ Dynamic threshold calculation failed for {stage}: {e}")
-            return 0.7
+        
+        sorted_values = sorted(values)
+        idx = int(len(sorted_values) * percentile / 100)
+        idx = min(idx, len(sorted_values) - 1)
+        return sorted_values[idx]
 
 # ===============================
-# Experiment Functions
+# Data Loading
 # ===============================
-
-
-
-
-
-
-# ===============================
-# MS MARCO & FiQA LLM Filtering Experiments
-# ===============================
-
-def load_ms_marco_data(max_queries: int = 10) -> List[Dict[str, Any]]:
-    """MS MARCO 데이터셋 로드 (실제 데이터셋 사용)"""
+def load_ms_marco_data(max_queries: int = 20) -> List[Dict[str, Any]]:
+    """MS MARCO 데이터셋 로드"""
     try:
         from datasets import load_dataset
         
-        print(f"🔄 MS MARCO 실제 데이터셋 로드 중... (최대 {max_queries}개 쿼리)")
+        print(f"🔄 MS MARCO 데이터셋 로드 중... (최대 {max_queries}개 쿼리)")
         
-        # MS MARCO v1.1 데이터셋 로드
         dataset = load_dataset('ms_marco', 'v1.1')
         train_data = dataset['train']
         
-        # 데이터 전처리 및 변환
         processed_data = []
         for i in range(min(max_queries, len(train_data))):
             sample = train_data[i]
             
-            # passages에서 텍스트와 관련성 레이블 추출
             passages_dict = sample['passages']
             passage_texts = passages_dict['passage_text']
             is_selected = passages_dict['is_selected']
@@ -998,1430 +238,735 @@ def load_ms_marco_data(max_queries: int = 10) -> List[Dict[str, Any]]:
                 'query_id': str(sample['query_id']),
                 'query': sample['query'],
                 'passages': passage_texts,
-                'relevance_labels': relevance_labels,  # 실제 Ground Truth
+                'relevance_labels': relevance_labels,
                 'answers': sample['answers'],
                 'query_type': sample.get('query_type', 'unknown')
             })
         
-        print(f"✅ MS MARCO 실제 데이터 로드 완료: {len(processed_data)}개 쿼리")
-        print(f"📊 첫 번째 쿼리 예시:")
-        print(f"   쿼리: \"{processed_data[0]['query']}\"")
-        print(f"   문서 수: {len(processed_data[0]['passages'])}개")
-        print(f"   관련 문서 수: {sum(processed_data[0]['relevance_labels'])}개")
-        
+        print(f"✅ MS MARCO 데이터 로드 완료: {len(processed_data)}개 쿼리")
         return processed_data
         
     except Exception as e:
         print(f"❌ MS MARCO 데이터 로드 실패: {e}")
-        print("🔄 테스트용 데이터로 대체합니다...")
-        
-        # 실패 시 테스트용 데이터로 대체
-        sample_data = [
-            {
-                'query_id': f'q_{i}',
-                'query': f'What is machine learning? Query {i}',
-                'passages': [
-                    f'Machine learning is a subset of artificial intelligence that enables computers to learn without being explicitly programmed. Document {i}-1',
-                    f'Deep learning uses neural networks with multiple layers to process data and make decisions. Document {i}-2',
-                    f'Natural language processing is a field of AI that focuses on the interaction between computers and human language. Document {i}-3',
-                    f'Computer vision is a field of AI that trains computers to interpret and understand visual information from images. Document {i}-4',
-                    f'The weather today is sunny with a temperature of 25 degrees Celsius. Document {i}-5',
-                    f'Data science combines statistics, programming, and domain expertise to extract insights from data. Document {i}-6'
-                ],
-                'relevance_labels': [1, 1, 1, 1, 0, 1],  # 테스트용 Ground Truth
-                'answers': [f'Machine learning is a subset of AI. Answer {i}']
-            }
-            for i in range(max_queries)
-        ]
-        
-        print(f"✅ MS MARCO 테스트 데이터 로드 완료: {len(sample_data)}개 쿼리")
-        return sample_data
-
-def load_fiqa_data(max_queries: int = 648) -> List[Dict[str, Any]]:
-    """FiQA 데이터셋 로드"""
-    try:
-        from datasets import load_dataset
-        dataset = load_dataset("mteb/fiqa", split="test")
-        
-        # 쿼리별로 문서 그룹핑
-        query_to_docs = defaultdict(list)
-        for item in dataset:
-            query_id = item['query-id']
-            corpus_id = item['corpus-id']
-            score = item['score']
-            query_to_docs[query_id].append((corpus_id, score))
-        
-        data = []
-        for query_id, docs in list(query_to_docs.items())[:max_queries]:
-            # 관련 문서만 필터링 (score > 0)
-            relevant_docs = [doc for doc in docs if doc[1] > 0]
-            if len(relevant_docs) < 2:  # 최소 2개 관련 문서 필요
-                continue
-            
-            # 상위 50개 문서 선택
-            top_docs = docs[:50]  # [(corpus_id, score), ...]
-            passages = [f"Financial document {cid}" for cid, _ in top_docs]
-            
-            # 관련성 레이블 생성 (passages와 동일 길이)
-            relevant_set = {cid for cid, s in docs if s > 0}
-            relevance_labels = [1 if cid in relevant_set else 0 for cid, _ in top_docs]
-                
-            data.append({
-                'query_id': query_id,
-                'query': f"Financial query {query_id}",  # 실제 쿼리 텍스트는 MTEB에서 제공하지 않음
-                'passages': passages,
-                'relevance_labels': relevance_labels,  # 실험 함수와 호환
-                'answers': [f"Answer for query {query_id}"]
-            })
-        
-        print(f"✅ FiQA 데이터 로드 완료: {len(data)}개 쿼리")
-        return data
-        
-    except Exception as e:
-        print(f"❌ FiQA 데이터 로드 실패: {e}")
         return []
 
-def create_llm_filtering_prompt(query: str, passages: List[str]) -> str:
-    """LLM 필터링을 위한 프롬프트 생성 (Decision + Confidence 형식)"""
-    return f"""You are an expert information retrieval system. Your task is to filter documents based on their relevance to the given query.
+# ===============================
+# Prompt Generation
+# ===============================
+def create_similarity_prompt(query: str, document: str) -> str:
+    """유사도 점수 평가 프롬프트 (점수만 반환)"""
+    return f"""Rate relevance between query and document. Respond with only a number between 0.0 and 1.0.
 
 Query: {query}
+Document: {document}
 
-Documents to evaluate:
-{chr(10).join([f"{i+1}. {passage}" for i, passage in enumerate(passages)])}
+Score:"""
 
-Instructions:
-1. For each document, decide whether to KEEP or DROP it
-2. Provide your confidence level (0.0-1.0) for this decision
-3. KEEP = relevant to the query, DROP = not relevant
-4. Confidence = how certain you are about your decision
-5. Be precise and consistent
+def create_sde_prompt(query: str) -> str:
+    """SDE (Semantic Data Expansion) 프롬프트"""
+    return f"""Generate 3 different ways to ask the same question. Do NOT repeat the original query.
 
-Format your response as:
-Document 1: KEEP, 0.85
-Document 2: DROP, 0.23
-Document 3: KEEP, 0.92
-...
-Document {len(passages)}: [DECISION], [CONFIDENCE]
+Original Query: "{query}"
 
-Scores:"""
+Rules:
+1) Create 3 different paraphrases of the original query
+2) Each paraphrase must be different from the original
+3) Make each paraphrase 1 sentence, ≤20 tokens
+4) Focus on different ways to express the same intent
 
-def parse_llm_decisions(response: str, num_docs: int) -> List[Dict[str, Any]]:
-    """LLM 응답에서 decision + confidence 파싱"""
-    decisions = []
-    lines = response.strip().split('\n')
+Output (3 lines, one paraphrase per line):"""
+
+# ===============================
+# LLM Interaction
+# ===============================
+def llm_cached_call(client, cache: ResponseCache, model_name: str, prompt: str, **kwargs) -> Tuple[str, Dict[str, Any]]:
+    """캐시된 LLM 호출"""
+    # 캐시 키 생성
+    cache_key = hashlib.md5(f"{model_name}:{prompt}".encode()).hexdigest()
     
-    for i in range(num_docs):
-        decision = "DROP"  # 기본값
-        confidence = 0.5   # 기본값
-        
-        for line in lines:
-            # Document N: 형식 찾기
-            if f"Document {i+1}:" in line:
-                import re
-                # KEEP/DROP 추출
-                if "KEEP" in line.upper():
-                    decision = "KEEP"
-                elif "DROP" in line.upper():
-                    decision = "DROP"
-                
-                # Confidence 추출 (0.0-1.0)
-                confidence_match = re.search(r'[01]\.\d+', line)
-                if confidence_match:
-                    try:
-                        confidence = float(confidence_match.group())
-                        confidence = max(0.0, min(1.0, confidence))
-                    except:
-                        confidence = 0.5
-                break
-        
-        decisions.append({
-            'decision': decision,
-            'confidence': confidence
-        })
+    # 캐시에서 조회
+    cached_response = cache.get(cache_key)
+    if cached_response is not None:
+        return cached_response, {"cached": True}
     
-    return decisions
-
-def parse_llm_scores(response: str, num_docs: int) -> List[float]:
-    """기존 호환성을 위한 함수 (deprecated)"""
-    decisions = parse_llm_decisions(response, num_docs)
-    return [d['confidence'] for d in decisions]
-
-def calculate_f1_metrics(predictions: List[float], ground_truth: List[int], threshold: float = 0.5) -> Dict[str, float]:
-    """기존 호환성을 위한 함수 (deprecated)"""
-    # predictions를 decisions 형식으로 변환
-    decisions = [{'decision': 'KEEP' if p >= threshold else 'DROP', 'confidence': p} for p in predictions]
-    return calculate_f1_metrics_from_decisions(decisions, ground_truth, threshold)
-
-def simple_cbc_routing(decision: str, confidence: float, stage_scores: List[float], absolute_threshold: float = 0.8, percentile_threshold: int = 85) -> str:
-    """단순한 CBC 라우팅: 절대값 + 상대값 기준"""
-    import numpy as np
-    
-    # 1. 절대 기준: 확실히 높은 confidence
-    if confidence >= absolute_threshold:
-        return "stop"  # 확실함 - 여기서 종료
-    
-    # 2. 상대 기준: 현재 배치에서 상위 percentile_threshold% 이상
-    if len(stage_scores) > 0:
-        relative_threshold = np.percentile(stage_scores, percentile_threshold)
-        if confidence >= relative_threshold:
-            return "stop"  # 상대적으로 높음 - 여기서 종료
-    
-    return "continue"  # 애매함 - 다음 단계로 라우팅
-
-def calculate_f1_metrics_from_decisions(decisions: List[Dict[str, Any]], ground_truth: List[int], confidence_threshold: float = 0.5) -> Dict[str, float]:
-    """Decision + Confidence에서 F1 점수 계산"""
-    if len(decisions) != len(ground_truth):
-        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
-    
-    # Decision + Confidence를 이진 분류로 변환
-    pred_binary = []
-    for decision in decisions:
-        # KEEP이고 confidence가 임계값 이상이면 1, 아니면 0
-        if decision['decision'] == 'KEEP' and decision['confidence'] >= confidence_threshold:
-            pred_binary.append(1)
+    # LLM 호출
+    if hasattr(client, 'generate'):
+        if isinstance(client, Ollama):
+            response = client.generate(model_name, prompt, **kwargs)
+        else:  # GeminiAPI
+            response = client.generate(prompt, **kwargs)
         else:
-            pred_binary.append(0)
+        response = ""
     
-    # True Positive, False Positive, False Negative 계산
-    tp = sum(1 for p, g in zip(pred_binary, ground_truth) if p == 1 and g == 1)
-    fp = sum(1 for p, g in zip(pred_binary, ground_truth) if p == 1 and g == 0)
-    fn = sum(1 for p, g in zip(pred_binary, ground_truth) if p == 0 and g == 1)
+    # 캐시에 저장
+    cache.set(cache_key, response)
     
-    # Precision, Recall, F1 계산
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 2 * precision * recall / max(precision + recall, 1e-9)
-    
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn
-    }
+    return response, {"cached": False}
 
-def run_llm_baseline_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
-    """① Large-scale LLM Only (Baseline) 실험"""
-    print("\n" + "="*60 + "\n🚀 Starting LLM Baseline Experiment\n" + "="*60, flush=True)
+# ===============================
+# Response Parsing
+# ===============================
+def parse_similarity_score(response: str) -> float:
+    """유사도 점수 파싱 (소수점 2자리까지 세분화)"""
+    try:
+        # 응답에서 숫자 추출 (0.0-1.0 범위)
+        score_match = re.search(r'(\d+\.?\d*)', response.strip())
+        if score_match:
+            score = float(score_match.group(1))
+            # 범위 정규화
+            if score > 1.0:
+                score = score / 10.0 if score <= 10.0 else score / 100.0
+            # 소수점 2자리까지 세분화
+            return round(max(0.0, min(1.0, score)), 2)
+    except:
+        pass
+    return 0.50  # 기본값 (소수점 2자리)
+
+def parse_sde_response(response: str, original_query: str) -> List[str]:
+    """SDE 응답 파싱 (본 쿼리와 중복 방지)"""
+    paraphrases = []
+    original_lower = original_query.lower().strip()
     
-    ollama = Ollama(config.ollama_url, config.temperature, config.top_p, config.seed)
-    cache = ResponseCache(".cache/llm_baseline_cache.jsonl")
+    for line in response.strip().split('\n'):
+        line = line.strip()
+        if line and not line.startswith('#'):
+            # 본 쿼리와 중복되지 않는지 확인 (대소문자 무시)
+            if line.lower().strip() != original_lower:
+                paraphrases.append(line)
+    
+    return paraphrases[:3]  # 최대 3개
+
+# ===============================
+# SDE Cache Management
+# ===============================
+def get_sde_cache_file_path(cache_dir: str) -> str:
+    """SDE 캐시 파일 경로 반환"""
+    return os.path.join(cache_dir, "sde_cache.json")
+
+def load_sde_cache(query: str, cache_dir: str) -> Optional[List[str]]:
+    """SDE 캐시에서 paraphrases 로드"""
+    cache_path = get_sde_cache_file_path(cache_dir)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                cache_list = json.load(f)
+                for item in cache_list:
+                    if item.get('query') == query:
+                        expanded = item.get('expanded', {})
+                        return expanded.get('paraphrases', [])
+        except Exception:
+            pass
+    return None
+
+def save_sde_cache(query: str, paraphrases: List[str], cache_dir: str):
+    """SDE 캐시에 paraphrases 저장"""
+    cache_path = get_sde_cache_file_path(cache_dir)
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    
+    cache_list = []
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                cache_list = json.load(f)
+        except Exception:
+            cache_list = []
+    
+    # 기존 항목 제거 (중복 방지)
+    cache_list = [item for item in cache_list if item.get('query') != query]
+    
+    # 새 항목 추가
+    cache_list.append({
+        'query': query,
+        'expanded': {
+            'paraphrases': paraphrases
+        }
+    })
+    
+    with open(cache_path, 'w', encoding='utf-8') as f:
+        json.dump(cache_list, f, ensure_ascii=False, indent=2)
+
+# ===============================
+# SDE (Semantic Data Expansion)
+# ===============================
+def generate_sde_paraphrases(client, cache: ResponseCache, model_name: str, query: str, config: LLMFilterConfig) -> List[str]:
+    """SDE paraphrases 생성 (캐시 활용, 본 쿼리와 중복 방지)"""
+    # 캐시에서 조회
+    cached_paraphrases = load_sde_cache(query, config.cache_dir)
+    if cached_paraphrases is not None:
+        print(f"🎯 [SDE Cache] Found cached paraphrases for query: {query[:50]}...")
+        return cached_paraphrases[:config.sde_k]
+    
+    # 캐시에 없으면 LLM으로 생성
+    print(f"🔄 [SDE Cache] Generating paraphrases for query: {query[:50]}...")
+    prompt = create_sde_prompt(query)
+    response, _ = llm_cached_call(client, cache, model_name, prompt)
+    paraphrases = parse_sde_response(response, query)
+    
+    # 원본 쿼리 추가 (첫 번째 paraphrase로)
+    paraphrases = [query] + paraphrases[:config.sde_k-1]
+    
+    # 캐시에 저장
+    save_sde_cache(query, paraphrases, config.cache_dir)
+    print(f"💾 [SDE Cache] Saved paraphrases for query: {query[:50]}...")
+    
+    return paraphrases
+
+# ===============================
+# SDE Cache (SDE paraphrases만 캐시)
+# ===============================
+def get_sde_cache(cache_dir: str) -> ResponseCache:
+    """SDE paraphrases 생성용 캐시만 반환"""
+    return ResponseCache(os.path.join(cache_dir, "sde_paraphrases_cache.jsonl"))
+
+# ===============================
+# Similarity Scoring
+# ===============================
+def score_similarity(client, model_name: str, query: str, document: str) -> float:
+    """단일 쿼리-문서 유사도 점수 계산 (캐시 없음)"""
+    prompt = create_similarity_prompt(query, document)
+    
+    # LLM 직접 호출 (캐시 없음)
+    if isinstance(client, Ollama):
+        response = client.generate(model_name, prompt)
+    else:  # GeminiAPI
+        response = client.generate(prompt)
+    
+    return parse_similarity_score(response)
+
+def score_documents(client, model_name: str, query: str, documents: List[str]) -> List[float]:
+    """쿼리에 대한 모든 문서 점수 계산 (캐시 없음)"""
+    scores = []
+    for document in documents:
+        score = score_similarity(client, model_name, query, document)
+        scores.append(score)
+    return scores
+
+# ===============================
+# CBC (Confidence-Based Calibration)
+# ===============================
+def apply_cbc_filtering(scores: List[float], cbc_stats: CBCStats, threshold: float = 0.5) -> List[Tuple[float, bool]]:
+    """CBC 기반 필터링 적용"""
+    if not cbc_stats.stats['overlap']:
+        # 통계가 없으면 기본 임계값 사용
+        return [(float(score), bool(score >= threshold)) for score in scores]
+    
+    # CBC 임계값 계산
+    cbc_threshold = cbc_stats.get_threshold('overlap', 80) * 0.8  # 보수적 적용
     
     results = []
-    start_time = time.time()
-    total_queries = len(data)
-    pbar = tqdm(total=total_queries, desc="Baseline (Heavy-only)", dynamic_ncols=True) if tqdm else None
+    for score in scores:
+        # 신뢰도 기반 보정
+        if score >= cbc_threshold:
+            results.append((float(score), True))
+                else:
+            results.append((float(score), False))
     
-    for idx, item in enumerate(data):
-        if pbar: pbar.update(1)
-        else: print(f"📊 Baseline 진행: {idx+1}/{total_queries} 쿼리 처리 중...", flush=True)
+    return results
+
+# ===============================
+# Metrics Calculation
+# ===============================
+def calculate_metrics(predictions: List[bool], ground_truth: List[int]) -> Dict[str, float]:
+    """평가 메트릭 계산"""
+    tp = sum(1 for p, g in zip(predictions, ground_truth) if p and g == 1)
+    fp = sum(1 for p, g in zip(predictions, ground_truth) if p and g == 0)
+    fn = sum(1 for p, g in zip(predictions, ground_truth) if not p and g == 1)
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'tp': tp,
+        'fp': fp,
+        'fn': fn
+    }
+
+# ===============================
+# Optimized Experiments (통합 점수 측정)
+# ===============================
+def generate_all_similarity_scores(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Dict[str, List[float]]]:
+    """모든 쿼리-문서 쌍의 유사도 점수를 한 번에 생성"""
+    print("\n🔄 모든 쿼리-문서 유사도 점수 생성 중...")
+    
+    # 클라이언트 초기화
+    if config.api_mode == "gemini":
+        client = GeminiAPI(config.gemini_api_key, config.gemini_model, config.temperature)
+        model_name = config.gemini_model
+    else:
+        client = Ollama(config.ollama_url, config.temperature, config.top_p)
+        model_name = config.model_name
+    
+    all_scores = {}
+    
+    for item in tqdm(data, desc="유사도 점수 생성"):
         query = item['query']
-        passages = item['passages']
+        passages = item['passages'][:config.max_passages]
         
-        # LLM으로 필터링 수행 (Decision + Confidence 형식)
-        prompt = create_llm_filtering_prompt(query, passages)
-        response, usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-        decisions = parse_llm_decisions(response, len(passages))
+        # SDE paraphrases 생성
+        paraphrases = generate_sde_paraphrases(client, get_sde_cache(config.cache_dir), model_name, query, config)
         
-        # 실제 MS MARCO Ground Truth 사용
-        ground_truth = item['relevance_labels']
+        query_scores = {}
+        for paraphrase in paraphrases:
+            scores = score_documents(client, model_name, paraphrase, passages)
+            query_scores[paraphrase] = scores
         
-        # 평가 지표 계산 (Decision + Confidence 기반)
-        metrics = calculate_f1_metrics_from_decisions(decisions, ground_truth)
+        all_scores[query] = query_scores
+    
+    return all_scores
+
+def run_experiments_with_scores(data: List[Dict[str, Any]], all_scores: Dict[str, Dict[str, List[float]]], config: LLMFilterConfig) -> List[Dict[str, Any]]:
+    """생성된 점수를 기반으로 모든 실험 실행"""
+    experiments = []
+    
+    # CBC 통계 초기화
+    cbc_stats = CBCStats(config.cbc_cache_path)
+    
+    for item in tqdm(data, desc="실험 실행"):
+        query = item['query']
+        ground_truth = [int(gt) for gt in item['relevance_labels'][:config.max_passages]]
         
-        # Cost 및 Latency 계산
-        cost = 3  # Heavy 모델만 사용
-        latency = usage.get('latency_s', 0.0)
+        query_scores = all_scores[query]
+        
+        # 실험별 결과 저장
+        experiment_results = {
+            'query': query,
+            'ground_truth': ground_truth,
+            'experiments': {}
+        }
+        
+        # 1. LLM Only (Baseline)
+        baseline_scores = query_scores[query]  # 본 쿼리만
+        baseline_predictions = [bool(score >= config.sim_threshold) for score in baseline_scores]
+        baseline_metrics = calculate_metrics(baseline_predictions, ground_truth)
+        experiment_results['experiments']['baseline'] = {
+            'scores': baseline_scores,
+            'predictions': baseline_predictions,
+            'metrics': baseline_metrics
+        }
+        
+        # 2. LLM + SDE
+        all_query_scores = list(query_scores.values())
+        sde_avg_scores = [np.mean([scores[i] for scores in all_query_scores]) for i in range(len(baseline_scores))]
+        sde_predictions = [bool(score >= config.sim_threshold) for score in sde_avg_scores]
+        sde_metrics = calculate_metrics(sde_predictions, ground_truth)
+        experiment_results['experiments']['sde'] = {
+            'scores': sde_avg_scores,
+            'predictions': sde_predictions,
+            'metrics': sde_metrics
+        }
+        
+        # 3. LLM + CBC
+        cbc_threshold = cbc_stats.get_threshold('overlap', 80) * 0.8 if cbc_stats.stats['overlap'] else config.sim_threshold
+        cbc_predictions = [bool(score >= cbc_threshold) for score in baseline_scores]
+        cbc_metrics = calculate_metrics(cbc_predictions, ground_truth)
+        experiment_results['experiments']['cbc'] = {
+            'scores': baseline_scores,
+            'predictions': cbc_predictions,
+            'metrics': cbc_metrics
+        }
+        
+        # 4. LLM + SDE + CBC
+        sde_cbc_predictions = [bool(score >= cbc_threshold) for score in sde_avg_scores]
+        sde_cbc_metrics = calculate_metrics(sde_cbc_predictions, ground_truth)
+        experiment_results['experiments']['sde_cbc'] = {
+            'scores': sde_avg_scores,
+            'predictions': sde_cbc_predictions,
+            'metrics': sde_cbc_metrics
+        }
+        
+        # CBC 통계 업데이트
+        if len(baseline_scores) > 1:
+            sorted_indices = sorted(range(len(baseline_scores)), key=lambda i: baseline_scores[i], reverse=True)
+            top_half = set(sorted_indices[:len(sorted_indices)//2])
+            ground_truth_top = set(i for i, gt in enumerate(ground_truth) if gt == 1)
+            overlap = len(top_half & ground_truth_top) / max(len(ground_truth_top), 1)
+            margin = baseline_scores[sorted_indices[0]] - baseline_scores[sorted_indices[1]]
+            cbc_stats.update(overlap, margin)
+        
+        experiments.append(experiment_results)
+    
+    return experiments
+
+def run_optimized_experiments(data: List[Dict[str, Any]], config: LLMFilterConfig) -> List[Dict[str, Any]]:
+    """최적화된 실험 실행"""
+    print("\n🚀 최적화된 LLM 필터링 실험")
+    print("="*60)
+    
+    # 1단계: 모든 유사도 점수 생성
+    all_scores = generate_all_similarity_scores(data, config)
+    
+    # 2단계: 실험별 필터링 및 평가
+    experiment_results = run_experiments_with_scores(data, all_scores, config)
+    
+    # 3단계: 결과 집계
+    final_results = []
+    
+    for exp_type in ['baseline', 'sde', 'cbc', 'sde_cbc']:
+        exp_precision = [r['experiments'][exp_type]['metrics']['precision'] for r in experiment_results]
+        exp_recall = [r['experiments'][exp_type]['metrics']['recall'] for r in experiment_results]
+        exp_f1 = [r['experiments'][exp_type]['metrics']['f1'] for r in experiment_results]
+        
+        overall_metrics = {
+            'precision': np.mean(exp_precision),
+            'recall': np.mean(exp_recall),
+            'f1': np.mean(exp_f1)
+        }
+        
+        final_results.append({
+            'experiment_type': f'LLM_{exp_type.upper()}',
+            'overall_metrics': overall_metrics,
+            'results': experiment_results
+        })
+        
+        print(f"✅ {exp_type.upper()}: P={overall_metrics['precision']:.3f}, R={overall_metrics['recall']:.3f}, F1={overall_metrics['f1']:.3f}")
+    
+    return final_results
+
+def _old_run_llm_sde_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
+    """2. LLM + SDE 실험"""
+    print("\n" + "="*60)
+    print("🚀 LLM + SDE 실험")
+    print("="*60)
+    
+    # 클라이언트 초기화
+    if config.api_mode == "gemini":
+        client = GeminiAPI(config.gemini_api_key, config.gemini_model, config.temperature)
+        model_name = config.gemini_model
+    else:
+        client = Ollama(config.ollama_url, config.temperature, config.top_p)
+        model_name = config.model_name
+    
+    # LLM 점수는 캐시하지 않음 (실시간 계산)
+    
+    results = []
+    total_latency = 0
+    
+    for item in tqdm(data, desc="LLM + SDE"):
+        query = item['query']
+        passages = item['passages'][:config.max_passages]
+        ground_truth = [int(gt) for gt in item['relevance_labels'][:config.max_passages]]
+        
+        start_time = time.time()
+        
+        # SDE paraphrases 생성
+        paraphrases = generate_sde_paraphrases(client, cache, model_name, query, config)
+        
+        # 각 paraphrase로 문서 점수 계산
+            all_scores = []
+        for paraphrase in paraphrases:
+            scores = score_documents(client, cache, model_name, paraphrase, passages)
+                all_scores.append(scores)
+            
+        # 점수 집계 (평균)
+        avg_scores = [np.mean([scores[i] for scores in all_scores]) for i in range(len(passages))]
+        
+        # 임계값 기반 예측
+        predictions = [bool(score >= config.sim_threshold) for score in avg_scores]
+        
+        latency = time.time() - start_time
+        total_latency += latency
+        
+        # 메트릭 계산
+        metrics = calculate_metrics(predictions, ground_truth)
         
         results.append({
-            'query_id': item['query_id'],
             'query': query,
-            'decisions': decisions,  # Decision + Confidence 정보
+            'paraphrases': paraphrases,
+            'all_scores': all_scores,
+            'avg_scores': avg_scores,
+            'predictions': predictions,
             'ground_truth': ground_truth,
             'metrics': metrics,
-            'model_used': 'heavy',  # Baseline은 항상 heavy 모델 사용
-            'usage': usage,
-            'cost_per_query': cost,
-            'latency_s': latency
+            'latency': latency
         })
     
-    end_time = time.time()
-    if pbar: pbar.close()
-    
-    # 전체 성능 계산
+    # 전체 메트릭 계산
     all_precision = [r['metrics']['precision'] for r in results]
     all_recall = [r['metrics']['recall'] for r in results]
     all_f1 = [r['metrics']['f1'] for r in results]
     
-    # 추가 지표 계산
-    all_latency = [r.get('latency_s', 0.0) for r in results]
-    all_cost = [r.get('cost_per_query', 3) for r in results]  # 기본값 3 (Heavy)
-    
     overall_metrics = {
-        'avg_precision': np.mean(all_precision),
-        'avg_recall': np.mean(all_recall),
-        'avg_f1': np.mean(all_f1),
-        'total_time': end_time - start_time,
-        'avg_time_per_query': (end_time - start_time) / len(results),
-        'avg_latency_ms': 1000.0 * np.mean(all_latency),
-        'avg_cost_per_query': np.mean(all_cost)
+        'precision': np.mean(all_precision),
+        'recall': np.mean(all_recall),
+        'f1': np.mean(all_f1),
+        'total_latency': total_latency,
+        'avg_latency': total_latency / len(results)
     }
     
-    print(f"✅ LLM Baseline Experiment completed")
-    print(f"📊 Average F1: {overall_metrics['avg_f1']:.3f}")
-    print(f"📊 Average Precision: {overall_metrics['avg_precision']:.3f}")
-    print(f"📊 Average Recall: {overall_metrics['avg_recall']:.3f}")
-    print("\n" + "="*60 + "\n✅ Finished LLM Baseline Experiment\n" + "="*60, flush=True)
+    print(f"✅ LLM + SDE 완료")
+    print(f"📊 Precision: {overall_metrics['precision']:.3f}")
+    print(f"📊 Recall: {overall_metrics['recall']:.3f}")
+    print(f"📊 F1: {overall_metrics['f1']:.3f}")
+    print(f"📊 총 시간: {total_latency:.1f}초")
     
     return {
-        'results': results,
+        'experiment_type': 'LLM_SDE',
         'overall_metrics': overall_metrics,
-        'experiment_type': 'LLM_Baseline'
-    }
-
-def run_llm_lite_route_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
-    """② Large-scale LLM + Lightweight LLM 실험"""
-    print("\n" + "="*60 + "\n🚀 Starting LLM Lite-Route Experiment\n" + "="*60, flush=True)
-    
-    ollama = Ollama(config.ollama_url, config.temperature, config.top_p, config.seed)
-    cache = ResponseCache(".cache/llm_lite_route_cache.jsonl")
-    
-    results = []
-    start_time = time.time()
-    total_queries = len(data)
-    pbar = tqdm(total=total_queries, desc="Lite Route", dynamic_ncols=True) if tqdm else None
-    
-    for idx, item in enumerate(data):
-        if pbar: pbar.update(1)
-        else: print(f"📊 Lite Route 진행: {idx+1}/{total_queries} 쿼리 처리 중...", flush=True)
-        query = item['query']
-        passages = item['passages']
-        
-        # 경량 LLM으로 먼저 시도
-        prompt = create_llm_filtering_prompt(query, passages)
-        lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
-        lite_decisions = parse_llm_decisions(lite_response, len(passages))
-        
-        # Lite LLM의 평균 confidence 계산
-        lite_confidences = [d['confidence'] for d in lite_decisions]
-        avg_confidence = sum(lite_confidences) / len(lite_confidences) if lite_confidences else 0.5
-        
-        # CBC 라우팅: 절대값 + 상대값 기준으로 판단
-        routing_decision = simple_cbc_routing("KEEP", avg_confidence, lite_confidences)
-        
-        # 라우팅 결정에 따라 처리
-        if routing_decision == "continue":
-            # Lite LLM 신뢰도가 낮음 → Heavy LLM으로 라우팅
-            heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-            final_decisions = parse_llm_decisions(heavy_response, len(passages))
-            model_used = 'heavy'
-            total_usage = {
-                'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-            }
-            # Cost 및 Latency 계산 (Lite + Heavy)
-            cost = 2 + 3  # Lite(2) + Heavy(3)
-            latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
-        else:
-            # Lite LLM에서 충분한 신뢰도 → 여기서 종료
-            final_decisions = lite_decisions
-            model_used = 'lite'
-            total_usage = lite_usage
-            # Cost 및 Latency 계산 (Lite만)
-            cost = 2  # Lite만 사용
-            latency = lite_usage.get('latency_s', 0.0)
-        
-        # 실제 MS MARCO Ground Truth 사용
-        ground_truth = item['relevance_labels']
-        
-        # 평가 지표 계산 (Decision + Confidence 기반)
-        metrics = calculate_f1_metrics_from_decisions(final_decisions, ground_truth)
-        
-        results.append({
-            'query_id': item['query_id'],
-            'query': query,
-            'decisions': final_decisions,  # Decision + Confidence 정보
-            'ground_truth': ground_truth,
-            'metrics': metrics,
-            'model_used': model_used,
-            'lite_confidence': avg_confidence,  # Lite LLM 평균 신뢰도
-            'routing_decision': routing_decision,  # 라우팅 결정
-            'usage': total_usage,
-            'cost_per_query': cost,
-            'latency_s': latency
-        })
-    
-    end_time = time.time()
-    if pbar: pbar.close()
-    
-    # 전체 성능 계산
-    all_precision = [r['metrics']['precision'] for r in results]
-    all_recall = [r['metrics']['recall'] for r in results]
-    all_f1 = [r['metrics']['f1'] for r in results]
-    
-    # 모델 사용 통계
-    lite_usage_count = sum(1 for r in results if r['model_used'] == 'lite')
-    heavy_usage_count = sum(1 for r in results if r['model_used'] == 'heavy')
-    
-    # 추가 지표 계산
-    all_latency = [r.get('latency_s', 0.0) for r in results]
-    all_cost = [r.get('cost_per_query', 3) for r in results]
-    
-    overall_metrics = {
-        'avg_precision': np.mean(all_precision),
-        'avg_recall': np.mean(all_recall),
-        'avg_f1': np.mean(all_f1),
-        'total_time': end_time - start_time,
-        'avg_time_per_query': (end_time - start_time) / len(results),
-        'avg_latency_ms': 1000.0 * np.mean(all_latency),
-        'avg_cost_per_query': np.mean(all_cost),
-        'model_usage': {
-            'lite': lite_usage_count,
-            'heavy': heavy_usage_count,
-            'lite_ratio': lite_usage_count / len(results)
-        }
-    }
-    
-    print(f"✅ LLM Lite-Route Experiment completed")
-    print(f"📊 Average F1: {overall_metrics['avg_f1']:.3f}")
-    print(f"📊 Lite usage: {overall_metrics['model_usage']['lite_ratio']:.1%}")
-    print("\n" + "="*60 + "\n✅ Finished LLM Lite-Route Experiment\n" + "="*60, flush=True)
-    
-    return {
-        'results': results,
-        'overall_metrics': overall_metrics,
-        'experiment_type': 'LLM_Lite_Route'
-    }
-
-def run_llm_setfit_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
-    """③ Large-scale LLM + Lightweight LLM + SetFit 실험 (온라인 학습)"""
-    print("\n" + "="*60 + "\n🚀 Starting LLM SetFit Experiment\n" + "="*60, flush=True)
-    
-    ollama = Ollama(config.ollama_url, config.temperature, config.top_p, config.seed)
-    cache = ResponseCache(".cache/llm_setfit_cache.jsonl")
-    setfit_helper = SetFitHelper()
-    
-    results = []
-    start_time = time.time()
-    total_queries = len(data)
-    pbar = tqdm(total=total_queries, desc="SetFit (online)", dynamic_ncols=True) if tqdm else None
-    
-    # SetFit 학습 데이터 수집 (온라인 학습용)
-    learning_samples = []
-    setfit_learning_threshold = config.warmup_k  # 처음 N개 쿼리는 학습용
-    
-    print(f"📚 SetFit 온라인 학습 시작: 처음 {setfit_learning_threshold}개 쿼리로 학습")
-    
-    for idx, item in enumerate(data):
-        if pbar: pbar.update(1)
-        else: print(f"📊 SetFit 진행: {idx+1}/{total_queries} 쿼리 처리 중...", flush=True)
-        query = item['query']
-        passages = item['passages']
-        
-        # 1단계: LLM으로 필터링 수행 (SetFit 없이)
-        if idx < setfit_learning_threshold:
-            # 학습 단계: 경량 LLM으로 먼저 시도
-            prompt = create_llm_filtering_prompt(query, passages)
-            lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
-            lite_scores = parse_llm_scores(lite_response, len(passages))
-            
-            # 개선된 신뢰도 계산 (LLM 응답 기반)
-            confidence = extract_confidence_from_llm_response(lite_response, lite_scores)
-            
-            if confidence < config.theta:
-                # 신뢰도 낮음 → 고성능 LLM 사용
-                heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-                final_scores = parse_llm_scores(heavy_response, len(passages))
-                model_used = 'heavy'
-                total_usage = {
-                    'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                    'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                    'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-                }
-                # Cost 및 Latency 계산 (Lite + Heavy)
-                cost = 2 + 3  # Lite(2) + Heavy(3)
-                latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
-            else:
-                final_scores = lite_scores
-                model_used = 'lite'
-                total_usage = lite_usage
-                # Cost 및 Latency 계산 (Lite만)
-                cost = 2  # Lite만 사용
-                latency = lite_usage.get('latency_s', 0.0)
-            
-            # 실제 MS MARCO Ground Truth 사용 (데이터셋 원본 레이블)
-            ground_truth = item['relevance_labels']
-            
-            # SetFit 학습 데이터 수집 (Ground Truth 기반)
-            for i, passage in enumerate(passages):
-                combined_text = f"{query} [SEP] {passage}"
-                # 실제 Ground Truth를 라벨로 사용 (데이터셋 원본 레이블)
-                ground_truth_label = ground_truth[i]
-                label = "HIGH" if ground_truth_label == 1 else "LOW"  # Ground Truth 기반 라벨
-                learning_samples.append((combined_text, label))
-            
-            # 평가 지표 계산
-            metrics = calculate_f1_metrics(final_scores, ground_truth)
-            
-            results.append({
-                'query_id': item['query_id'],
-                'query': query,
-                'scores': final_scores,
-                'ground_truth': ground_truth,
-                'metrics': metrics,
-                'model_used': model_used,
-                'setfit_confidence': None,  # 아직 SetFit 미사용
-                'usage': total_usage,
-                'phase': 'learning',
-                'cost_per_query': cost,
-                'latency_s': latency
-            })
-            
-            print(f"📖 학습 단계 {idx+1}/{setfit_learning_threshold}: {model_used} 모델 사용, F1={metrics['f1']:.3f}", flush=True)
-        
-        else:
-            # SetFit 사용 단계: 충분한 학습 데이터가 있으면 SetFit 활성화
-            if len(learning_samples) >= 16 and setfit_helper.model is None:  # 클래스당 8개 × 2클래스
-                print(f"🎯 SetFit 모델 활성화: {len(learning_samples)}개 샘플로 학습")
-                # SetFit 웜업
-                texts, labels = zip(*learning_samples)
-                setfit_helper.warmup(list(texts), list(labels))
-            
-            # SetFit으로 신뢰도 예측 (모델이 있으면)
-            if setfit_helper.model is not None:
-                setfit_confidences = []
-                for passage in passages:
-                    combined_text = f"{query} [SEP] {passage}"
-                    _, confidence = setfit_helper.predict_conf(combined_text)
-                    setfit_confidences.append(confidence)
-                
-                # SetFit 신뢰도 기반 라우팅
-                avg_setfit_confidence = np.mean(setfit_confidences)
-                
-                # SetFit 신뢰도에 관계없이 먼저 경량 LLM 사용
-                prompt = create_llm_filtering_prompt(query, passages)
-                lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
-                lite_scores = parse_llm_scores(lite_response, len(passages))
-                
-                # 개선된 Lite LLM 신뢰도 계산 (LLM 응답 기반)
-                lite_confidence = extract_confidence_from_llm_response(lite_response, lite_scores)
-                
-                if lite_confidence < config.theta:
-                    # Lite LLM 신뢰도 낮음 → 고성능 LLM 사용
-                    heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-                    final_scores = parse_llm_scores(heavy_response, len(passages))
-                    model_used = 'heavy'
-                    usage = {
-                        'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                        'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                        'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-                    }
-                else:
-                    # Lite LLM 신뢰도 높음 → Lite LLM 결과 사용
-                    final_scores = lite_scores
-                    model_used = 'lite'
-                    usage = lite_usage
-                
-                # SetFit 신뢰도 저장
-                setfit_confidence = avg_setfit_confidence
-            else:
-                # SetFit 모델이 없으면 기본 라우팅
-                prompt = create_llm_filtering_prompt(query, passages)
-                lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
-                lite_scores = parse_llm_scores(lite_response, len(passages))
-                confidence = 1.0 - np.std(lite_scores) if len(lite_scores) > 1 else 0.5
-                
-                if confidence < config.theta:
-                    heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-                    final_scores = parse_llm_scores(heavy_response, len(passages))
-                    model_used = 'heavy'
-                    usage = {
-                        'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                        'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                        'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-                    }
-                else:
-                    final_scores = lite_scores
-                    model_used = 'lite'
-                    usage = lite_usage
-                
-                final_scores = lite_scores if model_used == 'lite' else final_scores
-                setfit_confidence = None
-            
-            scores = final_scores
-            
-            # 실제 MS MARCO Ground Truth 사용 (데이터셋 원본 레이블)
-            ground_truth = item['relevance_labels']
-            
-            # 평가 지표 계산
-            metrics = calculate_f1_metrics(scores, ground_truth)
-            
-            # Cost 및 Latency 계산 (SetFit 사용 단계)
-            if model_used == 'setfit':
-                cost = 1  # SetFit만 사용
-                latency = 0.0  # SetFit은 즉시 처리
-            elif model_used == 'lite':
-                cost = 2  # Lite만 사용
-                latency = usage.get('latency_s', 0.0)
-            else:  # heavy
-                cost = 2 + 3  # Lite + Heavy
-                latency = usage.get('latency_s', 0.0)
-            
-            results.append({
-                'query_id': item['query_id'],
-                'query': query,
-                'scores': scores,
-                'ground_truth': ground_truth,
-                'metrics': metrics,
-                'model_used': model_used,
-                'setfit_confidence': setfit_confidence,
-                'usage': usage,
-                'phase': 'setfit' if setfit_helper.model is not None else 'fallback',
-                'cost_per_query': cost,
-                'latency_s': latency
-            })
-            
-            # SetFit 온라인 학습 (Ground Truth 기반, LLM 결과는 보조적 역할)
-            if setfit_helper.model is not None:
-                for i, passage in enumerate(passages):
-                    combined_text = f"{query} [SEP] {passage}"
-                    # Ground Truth를 주 라벨로 사용
-                    ground_truth_label = ground_truth[i]
-                    label = "HIGH" if ground_truth_label == 1 else "LOW"
-                    
-                    # LLM 결과와 Ground Truth가 일치하는 경우만 온라인 학습에 추가 (품질 보장)
-                    llm_score = scores[i]
-                    llm_prediction = "HIGH" if llm_score >= 0.5 else "LOW"
-                    if label == llm_prediction:  # LLM과 Ground Truth가 일치하는 경우만
-                        setfit_helper.add_online(combined_text, label)
-            
-            setfit_str = f"{setfit_confidence:.3f}" if setfit_confidence is not None else "N/A"
-            print(f"🎯 SetFit 단계 {idx+1}: {model_used} 모델 사용, F1={metrics['f1']:.3f}, SetFit={setfit_str}", flush=True)
-    
-    end_time = time.time()
-    if pbar: pbar.close()
-    
-    # 전체 성능 계산
-    all_precision = [r['metrics']['precision'] for r in results]
-    all_recall = [r['metrics']['recall'] for r in results]
-    all_f1 = [r['metrics']['f1'] for r in results]
-    
-    # 모델 사용 통계
-    lite_usage_count = sum(1 for r in results if r['model_used'] == 'lite')
-    heavy_usage_count = sum(1 for r in results if r['model_used'] == 'heavy')
-    
-    # SetFit 사용 통계
-    setfit_used_count = sum(1 for r in results if r.get('setfit_confidence') is not None)
-    
-    # 추가 지표 계산
-    all_latency = [r.get('latency_s', 0.0) for r in results]
-    all_cost = [r.get('cost_per_query', 3) for r in results]
-    
-    overall_metrics = {
-        'avg_precision': np.mean(all_precision),
-        'avg_recall': np.mean(all_recall),
-        'avg_f1': np.mean(all_f1),
-        'total_time': end_time - start_time,
-        'avg_time_per_query': (end_time - start_time) / len(results),
-        'avg_latency_ms': 1000.0 * np.mean(all_latency),
-        'avg_cost_per_query': np.mean(all_cost),
-        'model_usage': {
-            'lite': lite_usage_count,
-            'heavy': heavy_usage_count,
-            'lite_ratio': lite_usage_count / len(results)
-        },
-        'setfit_usage': {
-            'learning_queries': setfit_learning_threshold,
-            'setfit_activated': setfit_helper.model is not None,
-            'setfit_used_queries': setfit_used_count,
-            'learning_samples': len(learning_samples)
-        }
-    }
-    
-    print(f"✅ LLM SetFit Experiment completed")
-    print(f"📊 Average F1: {overall_metrics['avg_f1']:.3f}")
-    print(f"📊 Lite usage: {overall_metrics['model_usage']['lite_ratio']:.1%}")
-    print(f"📊 SetFit 학습: {overall_metrics['setfit_usage']['learning_samples']}개 샘플, {overall_metrics['setfit_usage']['setfit_used_queries']}개 쿼리에서 사용")
-    print("\n" + "="*60 + "\n✅ Finished LLM SetFit Experiment\n" + "="*60, flush=True)
-    
-    return {
-        'results': results,
-        'overall_metrics': overall_metrics,
-        'experiment_type': 'LLM_SetFit_Online_Learning'
+        'results': results
     }
 
 def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
-    """④ Large-scale LLM + Lightweight LLM + SetFit + CBC (Proposed) 실험 (온라인 학습)"""
-    print("\n" + "="*60 + "\n🚀 Starting LLM CBC Experiment\n" + "="*60, flush=True)
+    """3. LLM + CBC 실험"""
+    print("\n" + "="*60)
+    print("🚀 LLM + CBC 실험")
+    print("="*60)
     
-    ollama = Ollama(config.ollama_url, config.temperature, config.top_p, config.seed)
-    cache = ResponseCache(".cache/llm_cbc_cache.jsonl")
-    cbc_router = CBCRouter(config)
+    # 클라이언트 초기화
+    if config.api_mode == "gemini":
+        client = GeminiAPI(config.gemini_api_key, config.gemini_model, config.temperature)
+        model_name = config.gemini_model
+    else:
+        client = Ollama(config.ollama_url, config.temperature, config.top_p)
+        model_name = config.model_name
+    
+    # LLM 점수는 캐시하지 않음 (실시간 계산)
+    cbc_stats = CBCStats(config.cbc_cache_path)
     
     results = []
-    start_time = time.time()
-    total_queries = len(data)
-    pbar = tqdm(total=total_queries, desc="CBC (SetFit+Lite+Heavy)", dynamic_ncols=True) if tqdm else None
+    total_latency = 0
     
-    # SetFit 학습 데이터 수집 (온라인 학습용)
-    learning_samples = []
-    setfit_learning_threshold = config.warmup_k  # 처음 N개 쿼리는 학습용
-    
-    print(f"📚 CBC + SetFit 온라인 학습 시작: 처음 {setfit_learning_threshold}개 쿼리로 학습")
-    
-    for idx, item in enumerate(data):
-        if pbar: pbar.update(1)
-        else: print(f"📊 CBC 진행: {idx+1}/{total_queries} 쿼리 처리 중...", flush=True)
+    for item in tqdm(data, desc="LLM + CBC"):
         query = item['query']
-        passages = item['passages']
+        passages = item['passages'][:config.max_passages]
+        ground_truth = [int(gt) for gt in item['relevance_labels'][:config.max_passages]]
         
-        # 1단계: LLM으로 필터링 수행 (SetFit 없이)
-        if idx < setfit_learning_threshold:
-            # 학습 단계: 경량 LLM으로 먼저 시도
-            prompt = create_llm_filtering_prompt(query, passages)
-            lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
-            lite_scores = parse_llm_scores(lite_response, len(passages))
-            
-            # 개선된 신뢰도 계산 (LLM 응답 기반)
-            confidence = extract_confidence_from_llm_response(lite_response, lite_scores)
-            
-            if confidence < config.theta:
-                # 신뢰도 낮음 → 고성능 LLM 사용
-                heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-                final_scores = parse_llm_scores(heavy_response, len(passages))
-                model_used = 'heavy'
-                total_usage = {
-                    'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                    'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                    'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-                }
-                # Cost 및 Latency 계산 (Lite + Heavy)
-                cost = 2 + 3  # Lite(2) + Heavy(3)
-                latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
-            else:
-                final_scores = lite_scores
-                model_used = 'lite'
-                total_usage = lite_usage
-                # Cost 및 Latency 계산 (Lite만)
-                cost = 2  # Lite만 사용
-                latency = lite_usage.get('latency_s', 0.0)
-            
-            # 실제 MS MARCO Ground Truth 사용 (데이터셋 원본 레이블)
-            ground_truth = item['relevance_labels']
-            
-            # SetFit 학습 데이터 수집 (Ground Truth 기반)
-            for i, passage in enumerate(passages):
-                combined_text = f"{query} [SEP] {passage}"
-                # 실제 Ground Truth를 라벨로 사용 (데이터셋 원본 레이블)
-                ground_truth_label = ground_truth[i]
-                label = "HIGH" if ground_truth_label == 1 else "LOW"  # Ground Truth 기반 라벨
-                learning_samples.append((combined_text, label))
-            
-            # 평가 지표 계산
-            metrics = calculate_f1_metrics(final_scores, ground_truth)
-            
-            results.append({
-                'query_id': item['query_id'],
-                'query': query,
-                'scores': final_scores,
-                'ground_truth': ground_truth,
-                'metrics': metrics,
-                'model_used': model_used,
-                'setfit_confidence': None,  # 아직 SetFit 미사용
-                'usage': total_usage,
-                'phase': 'learning',
-                'cost_per_query': cost,
-                'latency_s': latency
-            })
-            
-            print(f"📖 CBC 학습 단계 {idx+1}/{setfit_learning_threshold}: {model_used} 모델 사용, F1={metrics['f1']:.3f}", flush=True)
+        start_time = time.time()
         
-        else:
-            # SetFit 사용 단계: 충분한 학습 데이터가 있으면 SetFit 활성화
-            if len(learning_samples) >= 16 and cbc_router.setfit_helper.model is None:  # 클래스당 8개 × 2클래스
-                print(f"🎯 CBC + SetFit 모델 활성화: {len(learning_samples)}개 샘플로 학습")
-                # SetFit 웜업
-                texts, labels = zip(*learning_samples)
-                cbc_router.setfit_helper.warmup(list(texts), list(labels))
-            
-            # CBC 기반 계층적 라우팅 수행
-            if cbc_router.setfit_helper.model is not None:
-                # SetFit + CBC 라우팅
-                routing_result = cbc_router.hierarchical_cbc_routing(query, passages[0] if passages else "", [])
-                
-                # SetFit에서 종료되는 경우 실제로 종료
-                if routing_result['stage'] == 'setfit':
-                    # SetFit 점수로 문서별 점수 생성
-                    combined = [f"{query} [SEP] {p}" for p in passages]
-                    probs = cbc_router.setfit_helper.model.predict_proba(combined)  # shape: [N,2]
-                    scores = [float(p[1]) for p in probs]  # HIGH 확률
-                    model_used = 'setfit'
-                    usage = {'total_tokens_est': 0, 'latency_s': 0.0}
-                    setfit_confidence = routing_result.get('confidence', None)
-                    # Cost 및 Latency 계산 (SetFit만 사용)
-                    cost = 1  # SetFit만 사용
-                    latency = 0.0  # SetFit은 즉시 처리
-                else:
-                    # SetFit 신뢰도에 관계없이 먼저 경량 LLM 사용
-                    prompt = create_llm_filtering_prompt(query, passages)
-                    lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
-                    lite_scores = parse_llm_scores(lite_response, len(passages))
-                    
-                    # 개선된 Lite LLM 신뢰도 계산 (LLM 응답 기반)
-                    lite_confidence = extract_confidence_from_llm_response(lite_response, lite_scores)
-                    
-                    if lite_confidence < config.theta:
-                        # Lite LLM 신뢰도 낮음 → 고성능 LLM 사용
-                        heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-                        scores = parse_llm_scores(heavy_response, len(passages))
-                        model_used = 'heavy'
-                        usage = {
-                            'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                            'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                            'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-                        }
-                        # Cost 및 Latency 계산 (Lite + Heavy)
-                        cost = 2 + 3  # Lite(2) + Heavy(3)
-                        latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
-                    else:
-                        # Lite LLM 신뢰도 높음 → Lite LLM 결과 사용
-                        scores = lite_scores
-                        model_used = 'lite'
-                        usage = lite_usage
-                        # Cost 및 Latency 계산 (Lite만)
-                        cost = 2  # Lite만 사용
-                        latency = lite_usage.get('latency_s', 0.0)
-                    
-                    setfit_confidence = routing_result.get('confidence', None)
-            else:
-                # SetFit 모델이 없으면 기본 라우팅
-                prompt = create_llm_filtering_prompt(query, passages)
-                lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
-                lite_scores = parse_llm_scores(lite_response, len(passages))
-                confidence = 1.0 - np.std(lite_scores) if len(lite_scores) > 1 else 0.5
-                
-                if confidence < config.theta:
-                    heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-                    scores = parse_llm_scores(heavy_response, len(passages))
-                    model_used = 'heavy'
-                    usage = {
-                        'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                        'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                        'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-                    }
-                    # Cost 및 Latency 계산 (Lite + Heavy)
-                    cost = 2 + 3  # Lite(2) + Heavy(3)
-                    latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
-                else:
-                    scores = lite_scores
-                    model_used = 'lite'
-                    usage = lite_usage
-                    # Cost 및 Latency 계산 (Lite만)
-                    cost = 2  # Lite만 사용
-                    latency = lite_usage.get('latency_s', 0.0)
-                
-                setfit_confidence = None
-            
-            # 실제 MS MARCO Ground Truth 사용 (데이터셋 원본 레이블)
-            ground_truth = item['relevance_labels']
-            
-            # 평가 지표 계산
-            metrics = calculate_f1_metrics(scores, ground_truth)
-            
-            # 모델 사용 통계
-            model_usage = {
-                'setfit': 1 if model_used == 'setfit' else 0,
-                'lite': 1 if model_used == 'lite' else 0,
-                'heavy': 1 if model_used == 'heavy' else 0
-            }
-            
-            results.append({
-                'query_id': item['query_id'],
-                'query': query,
-                'scores': scores,
-                'ground_truth': ground_truth,
-                'metrics': metrics,
-                'model_used': model_used,
-                'setfit_confidence': setfit_confidence,
-                'usage': usage,
-                'phase': 'cbc' if cbc_router.setfit_helper.model is not None else 'fallback',
-                'model_usage': model_usage,
-                'cost_per_query': cost,
-                'latency_s': latency
-            })
-            
-            # SetFit 온라인 학습 (Ground Truth 기반, LLM 결과는 보조적 역할)
-            if cbc_router.setfit_helper.model is not None:
-                for i, passage in enumerate(passages):
-                    combined_text = f"{query} [SEP] {passage}"
-                    # Ground Truth를 주 라벨로 사용
-                    ground_truth_label = ground_truth[i]
-                    label = "HIGH" if ground_truth_label == 1 else "LOW"
-                    
-                    # LLM 결과와 Ground Truth가 일치하는 경우만 온라인 학습에 추가 (품질 보장)
-                    llm_score = scores[i]
-                    llm_prediction = "HIGH" if llm_score >= 0.5 else "LOW"
-                    if label == llm_prediction:  # LLM과 Ground Truth가 일치하는 경우만
-                        cbc_router.setfit_helper.add_online(combined_text, label)
-            
-            setfit_str = f"{setfit_confidence:.3f}" if setfit_confidence is not None else "N/A"
-            print(f"🎯 CBC 단계 {idx+1}: {model_used} 모델 사용, F1={metrics['f1']:.3f}, SetFit={setfit_str}", flush=True)
+        # 단일 쿼리로 모든 문서 점수 계산
+        scores = score_documents(client, model_name, query, passages)
+        
+        # CBC 필터링 적용
+        cbc_results = apply_cbc_filtering(scores, cbc_stats, config.sim_threshold)
+        predictions = [bool(keep) for _, keep in cbc_results]
+        
+        # CBC 통계 업데이트 (간단한 overlap 계산)
+        if len(scores) > 1:
+            sorted_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+            top_half = set(sorted_indices[:len(sorted_indices)//2])
+            ground_truth_top = set(i for i, gt in enumerate(ground_truth) if gt == 1)
+            overlap = len(top_half & ground_truth_top) / max(len(ground_truth_top), 1)
+            margin = scores[sorted_indices[0]] - scores[sorted_indices[1]] if len(scores) > 1 else 0.0
+            cbc_stats.update(overlap, margin)
+        
+        latency = time.time() - start_time
+        total_latency += latency
+        
+        # 메트릭 계산
+        metrics = calculate_metrics(predictions, ground_truth)
+        
+        results.append({
+            'query': query,
+            'scores': scores,
+            'cbc_results': cbc_results,
+            'predictions': predictions,
+            'ground_truth': ground_truth,
+            'metrics': metrics,
+            'latency': latency
+        })
     
-    end_time = time.time()
-    if pbar: pbar.close()
-    
-    # 전체 성능 계산
+    # 전체 메트릭 계산
     all_precision = [r['metrics']['precision'] for r in results]
     all_recall = [r['metrics']['recall'] for r in results]
     all_f1 = [r['metrics']['f1'] for r in results]
-    
-    # 전체 모델 사용 통계
-    total_setfit = sum(r.get('model_usage', {}).get('setfit', 0) for r in results)
-    total_lite = sum(r.get('model_usage', {}).get('lite', 0) for r in results)
-    total_heavy = sum(r.get('model_usage', {}).get('heavy', 0) for r in results)
-    total_models = total_setfit + total_lite + total_heavy
-    
-    # SetFit 사용 통계
-    setfit_used_count = sum(1 for r in results if r.get('setfit_confidence') is not None)
-    
-    # 추가 지표 계산
-    all_latency = [r.get('latency_s', 0.0) for r in results]
-    all_cost = [r.get('cost_per_query', 3) for r in results]
-    
-    # Termination rates 계산
-    setfit_count = sum(1 for r in results if r.get('model_used') == 'setfit')
-    lite_count = sum(1 for r in results if r.get('model_used') == 'lite')
-    heavy_count = sum(1 for r in results if r.get('model_used') == 'heavy')
-    
-    overall_metrics = {
-        'avg_precision': np.mean(all_precision),
-        'avg_recall': np.mean(all_recall),
-        'avg_f1': np.mean(all_f1),
-        'total_time': end_time - start_time,
-        'avg_time_per_query': (end_time - start_time) / len(results),
-        'avg_latency_ms': 1000.0 * np.mean(all_latency),
-        'avg_cost_per_query': np.mean(all_cost),
-        'model_usage': {
-            'setfit': total_setfit,
-            'lite': total_lite,
-            'heavy': total_heavy,
-            'setfit_ratio': total_setfit / max(total_models, 1),
-            'lite_ratio': total_lite / max(total_models, 1),
-            'heavy_ratio': total_heavy / max(total_models, 1)
-        },
-        'term_rates': {
-            'setfit': setfit_count / len(results),
-            'lite': lite_count / len(results),
-            'heavy': heavy_count / len(results)
-        },
-        'setfit_usage': {
-            'learning_queries': setfit_learning_threshold,
-            'setfit_activated': cbc_router.setfit_helper.model is not None,
-            'setfit_used_queries': setfit_used_count,
-            'learning_samples': len(learning_samples)
-        }
-    }
-    
-    print(f"✅ LLM CBC Experiment completed")
-    print(f"📊 Average F1: {overall_metrics['avg_f1']:.3f}")
-    print(f"📊 Model usage: SetFit={overall_metrics['model_usage']['setfit_ratio']:.1%}, Lite={overall_metrics['model_usage']['lite_ratio']:.1%}, Heavy={overall_metrics['model_usage']['heavy_ratio']:.1%}")
-    print(f"📊 SetFit 학습: {overall_metrics['setfit_usage']['learning_samples']}개 샘플, {overall_metrics['setfit_usage']['setfit_used_queries']}개 쿼리에서 사용")
-    print("\n" + "="*60 + "\n✅ Finished LLM CBC Experiment\n" + "="*60, flush=True)
-    
-    return {
-        'results': results,
-        'overall_metrics': overall_metrics,
-        'experiment_type': 'LLM_CBC_Online_Learning'
-    }
-
-def run_integrated_llm_experiments(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
-    """통합 LLM 실험 - 모든 실험을 한 번에 실행하여 중복 제거"""
-    print("\n" + "="*80 + "\n🚀 Starting Integrated LLM Experiments (All-in-One)\n" + "="*80, flush=True)
-    
-    ollama = Ollama(config.ollama_url, config.temperature, config.top_p, config.seed)
-    cache = ResponseCache(".cache/integrated_llm_cache.jsonl")
-    setfit_helper = SetFitHelper()
-    cbc_router = CBCRouter(config)
-    
-    # 모든 실험 결과를 저장할 딕셔너리
-    all_results = {
-        'baseline': [],
-        'lite_route': [],
-        'setfit': [],
-        'cbc': []
-    }
-    
-    # 공통 변수들
-    start_time = time.time()
-    total_queries = len(data)
-    pbar = tqdm(total=total_queries, desc="Integrated Experiments", dynamic_ncols=True) if tqdm else None
-    
-    # SetFit 학습 데이터 수집
-    learning_samples = []
-    setfit_learning_threshold = config.warmup_k
-    
-    print(f"📚 통합 실험 시작: {total_queries}개 쿼리, 중복 계산 제거")
-    
-    for idx, item in enumerate(data):
-        if pbar: pbar.update(1)
-        else: print(f"📊 통합 실험 진행: {idx+1}/{total_queries} 쿼리 처리 중...", flush=True)
-        
-        query = item['query']
-        passages = item['passages']
-        ground_truth = item['relevance_labels']
-        
-        # 공통 프롬프트 생성 (한 번만)
-        prompt = create_llm_filtering_prompt(query, passages)
-        
-        # 1. Heavy LLM 결과 (모든 실험에서 공통 사용)
-        heavy_response, heavy_usage = ollama_cached_call(ollama, cache, config.gemma_heavy, prompt)
-        heavy_decisions = parse_llm_decisions(heavy_response, len(passages))
-        heavy_metrics = calculate_f1_metrics_from_decisions(heavy_decisions, ground_truth)
-        
-        # Baseline 결과 저장
-        all_results['baseline'].append({
-            'query_id': item['query_id'],
-            'query': query,
-            'decisions': heavy_decisions,
-            'ground_truth': ground_truth,
-            'metrics': heavy_metrics,
-            'model_used': 'heavy',
-            'usage': heavy_usage,
-            'cost_per_query': 3,
-            'latency_s': heavy_usage.get('latency_s', 0.0)
-        })
-        
-        # 2. Lite LLM 결과 (Lite Route, SetFit, CBC에서 공통 사용)
-        lite_response, lite_usage = ollama_cached_call(ollama, cache, config.gemma_lite, prompt)
-        lite_decisions = parse_llm_decisions(lite_response, len(passages))
-        lite_confidences = [d['confidence'] for d in lite_decisions]
-        avg_lite_confidence = sum(lite_confidences) / len(lite_confidences) if lite_confidences else 0.5
-        
-        # Lite Route 실험
-        lite_routing_decision = simple_cbc_routing("KEEP", avg_lite_confidence, lite_confidences)
-        if lite_routing_decision == "continue":
-            # Heavy로 라우팅
-            final_decisions = heavy_decisions
-            model_used = 'heavy'
-            total_usage = {
-                'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-            }
-            cost = 2 + 3
-            latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
-        else:
-            # Lite에서 종료
-            final_decisions = lite_decisions
-            model_used = 'lite'
-            total_usage = lite_usage
-            cost = 2
-            latency = lite_usage.get('latency_s', 0.0)
-        
-        lite_route_metrics = calculate_f1_metrics_from_decisions(final_decisions, ground_truth)
-        all_results['lite_route'].append({
-            'query_id': item['query_id'],
-            'query': query,
-            'decisions': final_decisions,
-            'ground_truth': ground_truth,
-            'metrics': lite_route_metrics,
-            'model_used': model_used,
-            'lite_confidence': avg_lite_confidence,
-            'routing_decision': lite_routing_decision,
-            'usage': total_usage,
-            'cost_per_query': cost,
-            'latency_s': latency
-        })
-        
-        # 3. SetFit 실험 (처음부터 라우팅에 참여)
-        # SetFit 모델이 없으면 초기화
-        if setfit_helper.model is None and len(learning_samples) >= 4:  # 최소 4개 샘플
-            print(f"🎯 SetFit 모델 초기화: {len(learning_samples)}개 샘플로 학습")
-            texts, labels = zip(*learning_samples)
-            setfit_helper.warmup(list(texts), list(labels))
-        
-        if setfit_helper.model is not None:
-            # SetFit 예측 (처음부터 참여)
-            combined = [f"{query} [SEP] {p}" for p in passages]
-            probs = setfit_helper.model.predict_proba(combined)
-            setfit_scores = [float(p[1]) for p in probs]
-            setfit_confidence = np.mean(setfit_scores)
-            
-            # SetFit 라우팅 결정 (낮은 임계값으로 시작)
-            setfit_routing = simple_cbc_routing("KEEP", setfit_confidence, setfit_scores, 
-                                              absolute_threshold=0.6, percentile_threshold=70)
-            
-            if setfit_routing == "stop":
-                # SetFit에서 종료 (높은 신뢰도)
-                setfit_decisions = [{'decision': 'KEEP' if s >= 0.5 else 'DROP', 'confidence': s} for s in setfit_scores]
-                setfit_model_used = 'setfit'
-                setfit_usage = {'total_tokens_est': 0, 'latency_s': 0.0}
-                setfit_cost = 1
-                setfit_latency = 0.0
-            else:
-                # SetFit 신뢰도 낮음 → Lite LLM으로 라우팅
-                lite_routing_decision = simple_cbc_routing("KEEP", avg_lite_confidence, lite_confidences)
-                if lite_routing_decision == "continue":
-                    # Lite도 낮음 → Heavy로 라우팅
-                    setfit_decisions = heavy_decisions
-                    setfit_model_used = 'heavy'
-                    setfit_usage = {
-                        'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                        'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                        'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-                    }
-                    setfit_cost = 2 + 3
-                    setfit_latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
-                else:
-                    # Lite에서 종료
-                    setfit_decisions = lite_decisions
-                    setfit_model_used = 'lite'
-                    setfit_usage = lite_usage
-                    setfit_cost = 2
-                    setfit_latency = lite_usage.get('latency_s', 0.0)
-        else:
-            # SetFit 모델 없음 → Lite LLM 사용
-            lite_routing_decision = simple_cbc_routing("KEEP", avg_lite_confidence, lite_confidences)
-            if lite_routing_decision == "continue":
-                # Lite 신뢰도 낮음 → Heavy로 라우팅
-                setfit_decisions = heavy_decisions
-                setfit_model_used = 'heavy'
-                setfit_usage = {
-                    'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                    'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                    'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-                }
-                setfit_cost = 2 + 3
-                setfit_latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
-            else:
-                # Lite에서 종료
-                setfit_decisions = lite_decisions
-                setfit_model_used = 'lite'
-                setfit_usage = lite_usage
-                setfit_cost = 2
-                setfit_latency = lite_usage.get('latency_s', 0.0)
-            setfit_confidence = None
-        
-        setfit_metrics = calculate_f1_metrics_from_decisions(setfit_decisions, ground_truth)
-        all_results['setfit'].append({
-            'query_id': item['query_id'],
-            'query': query,
-            'decisions': setfit_decisions,
-            'ground_truth': ground_truth,
-            'metrics': setfit_metrics,
-            'model_used': setfit_model_used,
-            'setfit_confidence': setfit_confidence,
-            'usage': setfit_usage,
-            'cost_per_query': setfit_cost,
-            'latency_s': setfit_latency
-        })
-        
-        # 4. CBC 실험 (SetFit + Lite + Heavy + CBC 라우팅)
-        # CBC SetFit 모델이 없으면 초기화
-        if cbc_router.setfit_helper.model is None and len(learning_samples) >= 4:  # 최소 4개 샘플
-            print(f"🎯 CBC + SetFit 모델 초기화: {len(learning_samples)}개 샘플로 학습")
-            texts, labels = zip(*learning_samples)
-            cbc_router.setfit_helper.warmup(list(texts), list(labels))
-        
-        if cbc_router.setfit_helper.model is not None:
-            # CBC SetFit 예측 (처음부터 참여)
-            combined = [f"{query} [SEP] {p}" for p in passages]
-            probs = cbc_router.setfit_helper.model.predict_proba(combined)
-            cbc_scores = [float(p[1]) for p in probs]
-            cbc_confidence = np.mean(cbc_scores)
-            
-            # CBC 라우팅 결정 (낮은 임계값으로 시작)
-            cbc_routing = simple_cbc_routing("KEEP", cbc_confidence, cbc_scores, 
-                                           absolute_threshold=0.6, percentile_threshold=70)
-            
-            if cbc_routing == "stop":
-                # CBC SetFit에서 종료 (높은 신뢰도)
-                cbc_decisions = [{'decision': 'KEEP' if s >= 0.5 else 'DROP', 'confidence': s} for s in cbc_scores]
-                cbc_model_used = 'setfit'
-                cbc_usage = {'total_tokens_est': 0, 'latency_s': 0.0}
-                cbc_cost = 1
-                cbc_latency = 0.0
-            else:
-                # CBC SetFit 신뢰도 낮음 → Lite LLM으로 라우팅
-                lite_routing_decision = simple_cbc_routing("KEEP", avg_lite_confidence, lite_confidences)
-                if lite_routing_decision == "continue":
-                    # Lite도 낮음 → Heavy로 라우팅
-                    cbc_decisions = heavy_decisions
-                    cbc_model_used = 'heavy'
-                    cbc_usage = {
-                        'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                        'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                        'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-                    }
-                    cbc_cost = 2 + 3
-                    cbc_latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
-                else:
-                    # Lite에서 종료
-                    cbc_decisions = lite_decisions
-                    cbc_model_used = 'lite'
-                    cbc_usage = lite_usage
-                    cbc_cost = 2
-                    cbc_latency = lite_usage.get('latency_s', 0.0)
-        else:
-            # CBC SetFit 모델 없음 → Lite LLM 사용
-            lite_routing_decision = simple_cbc_routing("KEEP", avg_lite_confidence, lite_confidences)
-            if lite_routing_decision == "continue":
-                # Lite 신뢰도 낮음 → Heavy로 라우팅
-                cbc_decisions = heavy_decisions
-                cbc_model_used = 'heavy'
-                cbc_usage = {
-                    'lite_tokens': lite_usage.get('total_tokens_est', 0),
-                    'heavy_tokens': heavy_usage.get('total_tokens_est', 0),
-                    'total_tokens': lite_usage.get('total_tokens_est', 0) + heavy_usage.get('total_tokens_est', 0)
-                }
-                cbc_cost = 2 + 3
-                cbc_latency = lite_usage.get('latency_s', 0.0) + heavy_usage.get('latency_s', 0.0)
-            else:
-                # Lite에서 종료
-                cbc_decisions = lite_decisions
-                cbc_model_used = 'lite'
-                cbc_usage = lite_usage
-                cbc_cost = 2
-                cbc_latency = lite_usage.get('latency_s', 0.0)
-            cbc_confidence = None
-        
-        cbc_metrics = calculate_f1_metrics_from_decisions(cbc_decisions, ground_truth)
-        all_results['cbc'].append({
-            'query_id': item['query_id'],
-            'query': query,
-            'decisions': cbc_decisions,
-            'ground_truth': ground_truth,
-            'metrics': cbc_metrics,
-            'model_used': cbc_model_used,
-            'cbc_confidence': cbc_confidence,
-            'usage': cbc_usage,
-            'cost_per_query': cbc_cost,
-            'latency_s': cbc_latency
-        })
-        
-        # SetFit 온라인 학습 (SetFit이 사용되지 않은 경우만 학습)
-        # SetFit이 사용된 경우: 학습하지 않음 (이미 확신을 가지고 결정했으므로)
-        # SetFit이 사용되지 않은 경우: L/H LLM의 결과를 학습
-        if setfit_helper.model is not None:
-            for i, passage in enumerate(passages):
-                combined_text = f"{query} [SEP] {passage}"
-                # SetFit이 사용되지 않은 경우만 학습
-                if setfit_confidence is None:
-                    # L/H LLM의 직접적인 결과를 학습 (Ground Truth와 일치하는 경우만)
-                    if lite_route_decisions[i]['decision'] == 'KEEP' and ground_truth[i] == 1:
-                        setfit_helper.add_online(combined_text, "HIGH")
-                    elif lite_route_decisions[i]['decision'] == 'DROP' and ground_truth[i] == 0:
-                        setfit_helper.add_online(combined_text, "LOW")
-        
-        # CBC SetFit 온라인 학습 (CBC SetFit이 사용되지 않은 경우만 학습)
-        # CBC SetFit이 사용된 경우: 학습하지 않음 (이미 확신을 가지고 결정했으므로)
-        # CBC SetFit이 사용되지 않은 경우: L/H LLM의 결과를 학습
-        if cbc_router.setfit_helper.model is not None:
-            for i, passage in enumerate(passages):
-                combined_text = f"{query} [SEP] {passage}"
-                # CBC SetFit이 사용되지 않은 경우만 학습
-                if cbc_setfit_confidence is None:
-                    # L/H LLM의 직접적인 결과를 학습 (Ground Truth와 일치하는 경우만)
-                    if lite_route_decisions[i]['decision'] == 'KEEP' and ground_truth[i] == 1:
-                        cbc_router.setfit_helper.add_online(combined_text, "HIGH")
-                    elif lite_route_decisions[i]['decision'] == 'DROP' and ground_truth[i] == 0:
-                        cbc_router.setfit_helper.add_online(combined_text, "LOW")
-    
-    end_time = time.time()
-    if pbar: pbar.close()
-    
-    # 각 실험별 전체 성능 계산
-    experiment_results = {}
-    for exp_name, results in all_results.items():
-        if not results:
-            continue
-            
-        all_precision = [r['metrics']['precision'] for r in results]
-        all_recall = [r['metrics']['recall'] for r in results]
-        all_f1 = [r['metrics']['f1'] for r in results]
-        all_latency = [r.get('latency_s', 0.0) for r in results]
-        all_cost = [r.get('cost_per_query', 3) for r in results]
         
         overall_metrics = {
-            'avg_precision': np.mean(all_precision),
-            'avg_recall': np.mean(all_recall),
-            'avg_f1': np.mean(all_f1),
-            'total_time': end_time - start_time,
-            'avg_time_per_query': (end_time - start_time) / len(results),
-            'avg_latency_ms': 1000.0 * np.mean(all_latency),
-            'avg_cost_per_query': np.mean(all_cost)
-        }
+        'precision': np.mean(all_precision),
+        'recall': np.mean(all_recall),
+        'f1': np.mean(all_f1),
+        'total_latency': total_latency,
+        'avg_latency': total_latency / len(results)
+    }
+    
+    print(f"✅ LLM + CBC 완료")
+    print(f"📊 Precision: {overall_metrics['precision']:.3f}")
+    print(f"📊 Recall: {overall_metrics['recall']:.3f}")
+    print(f"📊 F1: {overall_metrics['f1']:.3f}")
+    print(f"📊 총 시간: {total_latency:.1f}초")
         
-        experiment_results[exp_name] = {
-            'results': results,
+        return {
+        'experiment_type': 'LLM_CBC',
             'overall_metrics': overall_metrics,
-            'experiment_type': f'LLM_{exp_name.upper()}'
+        'results': results
+    }
+
+def run_llm_sde_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) -> Dict[str, Any]:
+    """4. LLM + SDE + CBC (Proposed) 실험"""
+    print("\n" + "="*60)
+    print("🚀 LLM + SDE + CBC (Proposed) 실험")
+    print("="*60)
+    
+    # 클라이언트 초기화
+    if config.api_mode == "gemini":
+        client = GeminiAPI(config.gemini_api_key, config.gemini_model, config.temperature)
+        model_name = config.gemini_model
+    else:
+        client = Ollama(config.ollama_url, config.temperature, config.top_p)
+        model_name = config.model_name
+    
+    # LLM 점수는 캐시하지 않음 (실시간 계산)
+    cbc_stats = CBCStats(config.cbc_cache_path)
+    
+    results = []
+    total_latency = 0
+    
+    for item in tqdm(data, desc="LLM + SDE + CBC"):
+        query = item['query']
+        passages = item['passages'][:config.max_passages]
+        ground_truth = [int(gt) for gt in item['relevance_labels'][:config.max_passages]]
+        
+        start_time = time.time()
+        
+        # SDE paraphrases 생성
+        paraphrases = generate_sde_paraphrases(client, get_sde_cache(config.cache_dir), model_name, query, config)
+        
+        # 각 paraphrase로 문서 점수 계산
+        all_scores = []
+        for paraphrase in paraphrases:
+            scores = score_documents(client, model_name, paraphrase, passages)
+            all_scores.append(scores)
+        
+        # 점수 집계 (평균)
+        avg_scores = [np.mean([scores[i] for scores in all_scores]) for i in range(len(passages))]
+        
+        # CBC 필터링 적용
+        cbc_results = apply_cbc_filtering(avg_scores, cbc_stats, config.sim_threshold)
+        predictions = [bool(keep) for _, keep in cbc_results]
+        
+        # CBC 통계 업데이트
+        if len(avg_scores) > 1:
+            sorted_indices = sorted(range(len(avg_scores)), key=lambda i: avg_scores[i], reverse=True)
+            top_half = set(sorted_indices[:len(sorted_indices)//2])
+            ground_truth_top = set(i for i, gt in enumerate(ground_truth) if gt == 1)
+            overlap = len(top_half & ground_truth_top) / max(len(ground_truth_top), 1)
+            margin = avg_scores[sorted_indices[0]] - avg_scores[sorted_indices[1]] if len(avg_scores) > 1 else 0.0
+            cbc_stats.update(overlap, margin)
+        
+        latency = time.time() - start_time
+        total_latency += latency
+        
+        # 메트릭 계산
+        metrics = calculate_metrics(predictions, ground_truth)
+        
+        results.append({
+            'query': query,
+            'paraphrases': paraphrases,
+            'all_scores': all_scores,
+            'avg_scores': avg_scores,
+            'cbc_results': cbc_results,
+            'predictions': predictions,
+            'ground_truth': ground_truth,
+            'metrics': metrics,
+            'latency': latency
+        })
+    
+    # 전체 메트릭 계산
+    all_precision = [r['metrics']['precision'] for r in results]
+    all_recall = [r['metrics']['recall'] for r in results]
+    all_f1 = [r['metrics']['f1'] for r in results]
+        
+        overall_metrics = {
+        'precision': np.mean(all_precision),
+        'recall': np.mean(all_recall),
+        'f1': np.mean(all_f1),
+        'total_latency': total_latency,
+        'avg_latency': total_latency / len(results)
+    }
+    
+    print(f"✅ LLM + SDE + CBC 완료")
+    print(f"📊 Precision: {overall_metrics['precision']:.3f}")
+    print(f"📊 Recall: {overall_metrics['recall']:.3f}")
+    print(f"📊 F1: {overall_metrics['f1']:.3f}")
+    print(f"📊 총 시간: {total_latency:.1f}초")
+        
+        return {
+        'experiment_type': 'LLM_SDE_CBC',
+            'overall_metrics': overall_metrics,
+        'results': results
         }
-    
-    print(f"\n✅ 통합 실험 완료!")
-    print(f"📊 총 소요 시간: {end_time - start_time:.1f}초")
-    print(f"📊 평균 쿼리당 시간: {(end_time - start_time) / total_queries:.1f}초")
-    
-    return experiment_results
 
-def run_ms_marco_llm_experiments(max_queries: int = 10) -> Dict[str, Any]:
-    """MS MARCO 데이터셋에 대한 LLM 필터링 실험 실행 (통합 버전)"""
-    print("🚀 MS MARCO LLM Filtering Experiments (Integrated)")
-    print("=" * 60)
+# ===============================
+# Main Execution
+# ===============================
+def main():
+    """메인 실행 함수"""
+    import argparse
     
-    # 데이터 로드
-    data = load_ms_marco_data(max_queries)
-    if not data:
-        print("❌ MS MARCO 데이터 로드 실패")
-        return {}
+    parser = argparse.ArgumentParser(description="LLM 기반 필터링 실험")
+    parser.add_argument('--max_queries', type=int, default=5, help='최대 쿼리 수')
+    parser.add_argument('--max_passages', type=int, default=100, help='최대 문서 수')
+    parser.add_argument('--api_mode', type=str, default='ollama', choices=['ollama', 'gemini'], help='API 모드')
+    parser.add_argument('--model_name', type=str, default='gemma3:latest', help='모델 이름')
+    parser.add_argument('--sim_threshold', type=float, default=0.5, help='유사도 임계값')
+    parser.add_argument('--sde_k', type=int, default=3, help='SDE 앵커 개수')
+    parser.add_argument('--cbc_enabled', action='store_true', help='CBC 활성화')
     
-    # 설정
+    args = parser.parse_args()
+    
+    # 설정 생성
     config = LLMFilterConfig(
-        max_queries=max_queries,
-        theta=0.6,  # 낮은 신뢰도 기준 (더 관대하게)
-        warmup_k=1,  # SetFit 학습용 최소 쿼리 수 (즉시 활성화)
-        setfit_epochs=1,  # SetFit 학습 epochs (속도 최적화)
-        setfit_batch_size=4,  # SetFit batch size (속도 최적화)
-        seed=42
+        max_queries=args.max_queries,
+        max_passages=args.max_passages,
+        api_mode=args.api_mode,
+        model_name=args.model_name,
+        sim_threshold=args.sim_threshold,
+        sde_k=args.sde_k,
+        cbc_enabled=args.cbc_enabled
     )
     
-    # 통합 실험 실행 (중복 제거)
-    print("\n📊 통합 실험 실행: 모든 실험을 한 번에 처리하여 중복 계산 제거")
-    experiments = run_integrated_llm_experiments(data, config)
-    
-    # 결과 비교
-    print("\n📈 MS MARCO LLM Filtering Results Summary")
-    print("=" * 60)
-    print(f"{'Method':<40} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Model Usage'}")
-    print("-" * 60)
-    
-    for name, exp in experiments.items():
-        metrics = exp['overall_metrics']
-        f1 = metrics['avg_f1']
-        precision = metrics['avg_precision']
-        recall = metrics['avg_recall']
-        
-        if 'model_usage' in metrics:
-            usage = metrics['model_usage']
-            if 'setfit_ratio' in usage:
-                model_usage = f"SetFit: {usage['setfit_ratio']:.1%}, Lite: {usage['lite_ratio']:.1%}, Heavy: {usage['heavy_ratio']:.1%}"
-            elif 'lite_ratio' in usage:
-                model_usage = f"Lite: {usage['lite_ratio']:.1%}"
-            else:
-                model_usage = "Heavy: 100%"
-        else:
-            model_usage = "Heavy: 100%"
-        
-        method_name = {
-            'baseline': 'LLM Only (Baseline)',
-            'lite_route': 'LLM + Lite Route',
-            'setfit': 'LLM + Lite + SetFit',
-            'cbc': 'LLM + Lite + SetFit + CBC (Proposed)'
-        }.get(name, name)
-        
-        print(f"{method_name:<40} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {model_usage}")
-    
-    # 결과 저장
-    output_dir = "results/llm/ms_marco"
-    ensure_dir(output_dir)
-    
-    for name, exp in experiments.items():
-        output_path = os.path.join(output_dir, f"llm_{name}_results.json")
-        save_json(exp, output_path)
-        print(f"💾 {name} 결과 저장: {output_path}")
-    
-    print(f"\n✅ MS MARCO LLM 실험 완료: {len(data)}개 쿼리")
-    return experiments
-
-def run_fiqa_llm_experiments(max_queries: int = 648) -> Dict[str, Any]:
-    """FiQA 데이터셋에 대한 LLM 필터링 실험 실행"""
-    print("🚀 FiQA LLM Filtering Experiments")
-    print("=" * 60)
-    
     # 데이터 로드
-    data = load_fiqa_data(max_queries)
+    data = load_ms_marco_data(config.max_queries)
     if not data:
-        print("❌ FiQA 데이터 로드 실패")
-        return {}
+        print("❌ 데이터 로드 실패")
+        return
     
-    # 설정
-    config = LLMFilterConfig(
-        max_queries=max_queries,
-        theta=0.8,  # 높은 신뢰도 기준
-        warmup_k=4,  # SetFit 학습용 최소 쿼리 수
-        seed=42
-    )
+    print(f"\n🚀 LLM 필터링 실험 시작")
+    print(f"📊 쿼리 수: {len(data)}")
+    print(f"📊 문서 수: {config.max_passages}")
+    print(f"📊 API 모드: {config.api_mode}")
+    print(f"📊 임계값: {config.sim_threshold}")
     
-    experiments = {}
+    # 실험 실행
+    experiments = []
     
-    # ① Large-scale LLM Only (Baseline)
-    print("\n📊 Experiment 1: Large-scale LLM Only (Baseline)")
-    experiments['baseline'] = run_llm_baseline_experiment(data, config)
+    # 1. LLM Baseline
+    baseline_result = run_llm_baseline_experiment(data, config)
+    experiments.append(baseline_result)
     
-    # ② Large-scale LLM + Lightweight LLM
-    print("\n📊 Experiment 2: Large-scale LLM + Lightweight LLM")
-    experiments['lite_route'] = run_llm_lite_route_experiment(data, config)
+    # 2. LLM + SDE
+    sde_result = run_llm_sde_experiment(data, config)
+    experiments.append(sde_result)
     
-    # ③ Large-scale LLM + Lightweight LLM + SetFit
-    print("\n📊 Experiment 3: Large-scale LLM + Lightweight LLM + SetFit")
-    experiments['setfit'] = run_llm_setfit_experiment(data, config)
+    # 3. LLM + CBC
+    cbc_result = run_llm_cbc_experiment(data, config)
+    experiments.append(cbc_result)
     
-    # ④ Large-scale LLM + Lightweight LLM + SetFit + CBC (Proposed)
-    print("\n📊 Experiment 4: Large-scale LLM + Lightweight LLM + SetFit + CBC (Proposed)")
-    experiments['cbc'] = run_llm_cbc_experiment(data, config)
-    
-    # 결과 비교
-    print("\n📈 FiQA LLM Filtering Results Summary")
-    print("=" * 60)
-    print(f"{'Method':<40} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Model Usage'}")
-    print("-" * 60)
-    
-    for name, exp in experiments.items():
-        metrics = exp['overall_metrics']
-        f1 = metrics['avg_f1']
-        precision = metrics['avg_precision']
-        recall = metrics['avg_recall']
-        
-        if 'model_usage' in metrics:
-            usage = metrics['model_usage']
-            if 'setfit_ratio' in usage:
-                model_usage = f"SetFit: {usage['setfit_ratio']:.1%}, Lite: {usage['lite_ratio']:.1%}, Heavy: {usage['heavy_ratio']:.1%}"
-            elif 'lite_ratio' in usage:
-                model_usage = f"Lite: {usage['lite_ratio']:.1%}"
-            else:
-                model_usage = "Heavy: 100%"
-        else:
-            model_usage = "Heavy: 100%"
-        
-        method_name = {
-            'baseline': 'LLM Only (Baseline)',
-            'lite_route': 'LLM + Lite Route',
-            'setfit': 'LLM + Lite + SetFit',
-            'cbc': 'LLM + Lite + SetFit + CBC (Proposed)'
-        }.get(name, name)
-        
-        print(f"{method_name:<40} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {model_usage}")
+    # 4. LLM + SDE + CBC
+    sde_cbc_result = run_llm_sde_cbc_experiment(data, config)
+    experiments.append(sde_cbc_result)
     
     # 결과 저장
-    output_dir = "results/llm/fiqa"
-    ensure_dir(output_dir)
+    os.makedirs(config.results_dir, exist_ok=True)
+    results_path = os.path.join(config.results_dir, "llm_experiments_results.json")
     
-    for name, exp in experiments.items():
-        output_path = os.path.join(output_dir, f"llm_{name}_results.json")
-        save_json(exp, output_path)
-        print(f"💾 {name} 결과 저장: {output_path}")
+    with open(results_path, 'w', encoding='utf-8') as f:
+        json.dump(experiments, f, ensure_ascii=False, indent=2)
     
-    print(f"\n✅ FiQA LLM 실험 완료: {len(data)}개 쿼리")
-    return experiments
-
+    # 결과 요약
+    print("\n" + "="*80)
+    print("📊 실험 결과 요약")
+    print("="*80)
+    
+    for exp in experiments:
+        exp_type = exp['experiment_type']
+        metrics = exp['overall_metrics']
+        print(f"{exp_type:15} | P: {metrics['precision']:.3f} | R: {metrics['recall']:.3f} | F1: {metrics['f1']:.3f} | Time: {metrics['total_latency']:.1f}s")
+    
+    print(f"\n💾 결과 저장: {results_path}")
+    print("✅ 모든 실험 완료!")
 
 if __name__ == "__main__":
-    # 개별 데이터셋 실험 실행 예시
-    print("LLM Filtering Experiments")
-    print("=" * 50)
-    print("개별 데이터셋 실험을 실행하려면:")
-    print("- MS MARCO: python run_llm_ms_marco.py")
-    print("- FiQA: python run_llm_fiqa.py")
+    main()

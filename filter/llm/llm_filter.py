@@ -224,24 +224,24 @@ class CBCStats:
         }
     
     def get_adaptive_threshold(self, metric: str) -> float:
-        """분포 특성에 따른 적응적 임계값 계산"""
+        """분포 특성에 따른 적응적 임계값 계산 (더 적극적 필터링)"""
         values = self.stats.get(metric, [])
         if not values:
-            return 0.5  # 기본값
+            return 0.7  # 더 높은 기본값
         
         # 분포 특성 분석
         dist_info = self.analyze_distribution(metric)
         
-        # 분포 특성에 따른 percentile 조정
+        # 더 적극적인 percentile 사용
         if dist_info["type"] == "low_variance":
-            # 낮은 분산: 더 엄격한 기준 (높은 percentile)
-            percentile = 85
+            # 낮은 분산: 매우 엄격한 기준
+            percentile = 90
         elif dist_info["type"] == "high_variance":
-            # 높은 분산: 더 관대한 기준 (낮은 percentile)
-            percentile = 60
+            # 높은 분산: 여전히 엄격한 기준
+            percentile = 80
         else:
-            # 균형: 중간 기준
-            percentile = 75
+            # 균형: 높은 기준
+            percentile = 85
         
         # 동적 percentile 적용
         sorted_values = sorted(values)
@@ -249,8 +249,8 @@ class CBCStats:
         idx = min(idx, len(sorted_values) - 1)
         threshold = sorted_values[idx]
         
-        # 안전장치: 임계값 범위 제한
-        threshold = max(0.1, min(0.9, threshold))
+        # 더 높은 최소 임계값으로 조정
+        threshold = max(0.5, min(0.9, threshold))
         
         return threshold
 
@@ -423,7 +423,7 @@ def get_sde_cache_file_path(cache_dir: str) -> str:
     return os.path.join(cache_dir, "sde_cache.json")
 
 def load_sde_cache(query: str, cache_dir: str) -> Optional[List[str]]:
-    """SDE 캐시에서 anchors 로드 (s_filter.py와 동일)"""
+    """SDE 캐시에서 paraphrases 로드"""
     cache_path = get_sde_cache_file_path(cache_dir)
     if os.path.exists(cache_path):
         try:
@@ -432,13 +432,13 @@ def load_sde_cache(query: str, cache_dir: str) -> Optional[List[str]]:
                 for item in cache_list:
                     if item.get('query') == query:
                         expanded = item.get('expanded', {})
-                        return expanded.get('anchors', [])
+                        return expanded.get('paraphrases', [])
         except Exception:
             pass
     return None
 
-def save_sde_cache(query: str, anchors: List[str], cache_dir: str):
-    """SDE 캐시에 anchors 저장 (s_filter.py와 동일한 구조)"""
+def save_sde_cache(query: str, paraphrases: List[str], cache_dir: str):
+    """SDE 캐시에 paraphrases 저장"""
     cache_path = get_sde_cache_file_path(cache_dir)
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     
@@ -453,11 +453,11 @@ def save_sde_cache(query: str, anchors: List[str], cache_dir: str):
     # 기존 항목 제거 (중복 방지)
     cache_list = [item for item in cache_list if item.get('query') != query]
     
-    # 새 항목 추가 (s_filter.py와 동일한 구조)
+    # 새 항목 추가
     cache_list.append({
         'query': query,
         'expanded': {
-            'anchors': anchors
+            'paraphrases': paraphrases
         }
     })
     
@@ -475,19 +475,33 @@ def generate_anchors_ollama(client, model_name: str, query: str, num_anchors: in
     cache_key = f"anchors_{hashlib.md5(query.encode()).hexdigest()}"
     
     # 캐시에서 조회
-    cached_anchors = load_sde_cache(query, config.cache_dir)
-    if cached_anchors:
-        print(f"🎯 [Cache] Found cached anchors for query: {query[:50]}...")
-        return cached_anchors[:num_anchors]
+    cached_paraphrases = load_sde_cache(query, config.cache_dir)
+    if cached_paraphrases:
+        print(f"🎯 [Cache] Found cached paraphrases for query: {query[:50]}...")
+        return cached_paraphrases[:num_anchors]
     
     print(f"🔄 [Cache] Generating {num_anchors} anchors for query: {query[:50]}...")
     
-    # s_filter.py와 동일한 프롬프트
+    # Hard Negative 대비형 paraphrase 생성 프롬프트
     prompt = (
-        f"Generate {num_anchors} simple questions that mean the same as: {query}\n"
-        f"Use everyday words. Make them short and clear. "
-        f"Examples: 'How much do I pay each month?' or 'What's the best way to save money?' "
-        f"Just write the questions, one per line. No explanations, no numbers, no extra text.\n"
+        f"Generate {num_anchors} paraphrases of: '{query}'\n"
+        f"Goal: Create variations that help distinguish relevant documents from irrelevant ones.\n"
+        f"\n"
+        f"Rules:\n"
+        f"1. Keep similar length (original ±30%)\n"
+        f"2. Vary structure/expression significantly\n"
+        f"3. Preserve core intent but use different perspectives\n"
+        f"4. Include domain-specific terms when appropriate\n"
+        f"5. Make each paraphrase semantically distinct\n"
+        f"\n"
+        f"Strategy examples:\n"
+        f"- Direct variation: 'average Walgreens sales per store'\n"
+        f"- Synonym variation: 'typical revenue at Walgreens locations'\n"
+        f"- Structure variation: 'how much does a Walgreens store usually sell'\n"
+        f"- Statistical variation: 'median Walgreens store sales'\n"
+        f"- Temporal variation: 'Walgreens daily sales per store'\n"
+        f"\n"
+        f"Write only the paraphrases, one per line. No explanations.\n"
     )
     
     # LLM 호출
@@ -508,9 +522,9 @@ def generate_anchors_ollama(client, model_name: str, query: str, num_anchors: in
             uniq.append(a)
     
     if uniq:
-        # 캐시에 저장 (s_filter.py와 동일한 구조)
+        # 캐시에 저장
         save_sde_cache(query, uniq, config.cache_dir)
-        print(f"💾 [Cache] Saved {len(uniq)} anchors for query: {query[:50]}...")
+        print(f"💾 [Cache] Saved {len(uniq)} paraphrases for query: {query[:50]}...")
     
     return uniq
 
@@ -548,26 +562,29 @@ def score_documents(client, model_name: str, query: str, documents: List[str]) -
 # CBC (Confidence-Based Calibration)
 # ===============================
 def cbc_threshold_per_query(scores: List[float]) -> float:
-    """쿼리 단위 CBC 임계값 계산 (연구 서술과 일치)"""
+    """쿼리 단위 CBC 임계값 계산 (더 적극적인 필터링)"""
     if not scores:
         return 0.5
     
     std = np.std(scores)
-    pct = 0.2  # 기본 20th percentile
+    # 더 적극적인 percentile 사용
+    pct = 0.3  # 기본 30th percentile (더 높은 임계값)
     
     if std < 0.1:
-        pct = 0.1  # 10th percentile
+        pct = 0.25  # 25th percentile
     elif std > 0.3:
-        pct = 0.3  # 30th percentile
+        pct = 0.4  # 40th percentile
     
     thr = np.quantile(scores, pct)
-    # 안전장치
-    return float(np.clip(thr, 0.1, 0.9))
+    # 더 높은 최소 임계값으로 조정
+    return float(np.clip(thr, 0.2, 0.8))
 
 def apply_cbc_filtering(scores: List[float], threshold: float = 0.5) -> List[Tuple[float, bool]]:
-    """CBC 기반 필터링 적용 (쿼리 단위 분포 기반)"""
+    """CBC 기반 필터링 적용 (쿼리 단위 분포 기반) - 더 적극적 필터링"""
     cbc_threshold = cbc_threshold_per_query(scores)
-    return [(float(score), score >= cbc_threshold) for score in scores]
+    # 더 적극적인 필터링을 위해 임계값을 높임
+    aggressive_threshold = max(cbc_threshold, 0.6)  # 최소 0.6 이상
+    return [(float(score), score >= aggressive_threshold) for score in scores]
 
 # ===============================
 # Metrics Calculation (s_filter.py 방식으로 수정)
@@ -721,33 +738,31 @@ def run_experiments_with_scores(data: List[Dict[str, Any]], all_scores: Dict[str
             'filter_metrics': baseline_filter_metrics
         }
         
-        # 2. LLM + SDE (CBC 시너지 최적화된 집계)
+        # 2. LLM + SDE (s_filter.py와 동일한 Max Pooling 방식)
         all_query_scores = list(query_scores.values())
         
-        # 원본 쿼리 제외하고 앵커만 사용
-        anchor_scores = all_query_scores[1:] if len(all_query_scores) > 1 else all_query_scores
+        # 원본 쿼리 점수
+        original_scores = baseline_scores
+        
+        # 앵커 점수들 (원본 제외)
+        anchor_scores = all_query_scores[1:] if len(all_query_scores) > 1 else []
         
         if len(anchor_scores) > 0:
-            # CBC와 시너지를 위한 고도화된 집계 전략
-            sde_avg_scores = [np.mean([scores[i] for scores in anchor_scores]) for i in range(len(baseline_scores))]
-            sde_max_scores = [np.max([scores[i] for scores in anchor_scores]) for i in range(len(baseline_scores))]
-            sde_min_scores = [np.min([scores[i] for scores in anchor_scores]) for i in range(len(baseline_scores))]
+            # 개선된 Score Fusion 방식 (원본 + paraphrase 신호 합산)
+            # 1단계: 앵커들 중 최고 점수
+            anchor_max_scores = [np.max([scores[i] for scores in anchor_scores]) for i in range(len(original_scores))]
             
-            # CBC 분포 특성을 고려한 적응적 집계
-            # 분산이 높으면 평균, 낮으면 최대값 사용
-            score_variance = np.var([np.mean(scores) for scores in anchor_scores])
-            if score_variance > 0.1:  # 높은 분산
-                sde_final_scores = sde_avg_scores  # 평균으로 안정화
-            else:  # 낮은 분산
-                sde_final_scores = sde_max_scores  # 최대값으로 공격적 필터링
+            # 2단계: 가중 평균 Score Fusion (원본 60% + paraphrase 40%)
+            # 이렇게 하면 paraphrase가 원본보다 낮아도 전체적인 신호 강화 효과
+            sde_final_scores = [0.6 * original_scores[i] + 0.4 * anchor_max_scores[i] for i in range(len(original_scores))]
         else:
-            sde_final_scores = baseline_scores
+            sde_final_scores = original_scores
         
         sde_filter_metrics = compute_filtering_metrics_llm(
             sde_final_scores, candidate_pool, positive_docs, negative_docs, config.sim_threshold
         )
         experiment_results['experiments']['sde'] = {
-            'scores': sde_avg_scores,
+            'scores': sde_final_scores,
             'filter_metrics': sde_filter_metrics
         }
         
@@ -767,7 +782,7 @@ def run_experiments_with_scores(data: List[Dict[str, Any]], all_scores: Dict[str
             sde_final_scores, candidate_pool, positive_docs, negative_docs, cbc_threshold
         )
         experiment_results['experiments']['sde_cbc'] = {
-            'scores': sde_avg_scores,
+            'scores': sde_final_scores,
             'filter_metrics': sde_cbc_filter_metrics
         }
         
@@ -929,21 +944,24 @@ def run_llm_sde_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
 
         start_time = time.time()
         
+        # 원본 쿼리 점수 계산
+        original_scores = score_documents(client, model_name, query, passages)
+        
         # 앵커 생성 (s_filter.py와 동일)
         anchors = generate_anchors_ollama(client, model_name, query, config.sde_k, config)
 
         # 각 앵커로 점수 계산
-        all_scores = [score_documents(client, model_name, anchor, passages) for anchor in anchors]
+        anchor_scores = [score_documents(client, model_name, anchor, passages) for anchor in anchors]
         
-        # 집계: 분산 높으면 평균(안정화), 분산 낮으면 최대값(공격적)
-        if all_scores:
-            var = np.var([np.mean(s) for s in all_scores])
-            if var > 0.1:  # 높은 분산
-                agg_scores = [np.mean([s[i] for s in all_scores]) for i in range(len(passages))]
-            else:  # 낮은 분산
-                agg_scores = [np.max([s[i] for s in all_scores]) for i in range(len(passages))]
+        # 개선된 Score Fusion 방식
+        if anchor_scores:
+            # 앵커들 중 최고 점수
+            anchor_max_scores = [np.max([s[i] for s in anchor_scores]) for i in range(len(passages))]
+            
+            # 가중 평균 Score Fusion (원본 60% + paraphrase 40%)
+            agg_scores = [0.6 * original_scores[i] + 0.4 * anchor_max_scores[i] for i in range(len(passages))]
         else:
-            agg_scores = [0.5] * len(passages)
+            agg_scores = original_scores
 
         # 임계값 기반 예측
         predictions = [bool(x >= config.sim_threshold) for x in agg_scores]
@@ -1122,24 +1140,27 @@ def run_llm_sde_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConf
         
         start_time = time.time()
         
+        # 원본 쿼리 점수 계산
+        original_scores = score_documents(client, model_name, query, passages)
+        
         # 앵커 생성 (s_filter.py와 동일)
         anchors = generate_anchors_ollama(client, model_name, query, config.sde_k, config)
         
         # 각 앵커로 문서 점수 계산
-        all_scores = []
+        anchor_scores = []
         for anchor in anchors:
             scores = score_documents(client, model_name, anchor, passages)
-            all_scores.append(scores)
+            anchor_scores.append(scores)
         
-        # 점수 집계 (분산 적응 방식 - SDE와 일관성)
-        if all_scores:
-            var = np.var([np.mean(s) for s in all_scores])
-            if var > 0.1:  # 높은 분산
-                avg_scores = [np.mean([s[i] for s in all_scores]) for i in range(len(passages))]
-            else:  # 낮은 분산
-                avg_scores = [np.max([s[i] for s in all_scores]) for i in range(len(passages))]
+        # 개선된 Score Fusion 방식
+        if anchor_scores and len(anchor_scores) > 0:
+            # 앵커들 중 최고 점수
+            anchor_max_scores = [np.max([s[i] for s in anchor_scores]) for i in range(len(passages))]
+            
+            # 가중 평균 Score Fusion (원본 60% + paraphrase 40%)
+            avg_scores = [0.6 * original_scores[i] + 0.4 * anchor_max_scores[i] for i in range(len(passages))]
         else:
-            avg_scores = [0.5] * len(passages)
+            avg_scores = original_scores
         
         # CBC 필터링 적용 (수정된 시그니처)
         cbc_results = apply_cbc_filtering(avg_scores, config.sim_threshold)

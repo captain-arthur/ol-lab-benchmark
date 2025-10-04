@@ -619,28 +619,28 @@ def score_documents(client, model_name: str, query: str, documents: List[str]) -
 # CBC (Confidence-Based Calibration)
 # ===============================
 def cbc_threshold_per_query(scores: List[float]) -> float:
-    """쿼리 단위 CBC 임계값 계산 (더 적극적인 필터링)"""
+    """쿼리 단위 CBC 임계값 계산 (고정 임계값 0.95 수준의 높은 성능)"""
     if not scores:
-        return 0.5
+        return 0.95
     
     std = np.std(scores)
-    # 더 적극적인 percentile 사용
-    pct = 0.3  # 기본 30th percentile (더 높은 임계값)
+    # 매우 적극적인 percentile 사용 (고정 임계값 0.95 수준)
+    pct = 0.8  # 80th percentile (매우 높은 임계값)
     
     if std < 0.1:
-        pct = 0.25  # 25th percentile
+        pct = 0.75  # 75th percentile
     elif std > 0.3:
-        pct = 0.4  # 40th percentile
+        pct = 0.85  # 85th percentile
     
     thr = np.quantile(scores, pct)
-    # 더 높은 최소 임계값으로 조정
-    return float(np.clip(thr, 0.2, 0.8))
+    # 고정 임계값 0.95 수준으로 조정
+    return float(np.clip(thr, 0.9, 0.98))
 
 def apply_cbc_filtering(scores: List[float], threshold: float = 0.5) -> List[Tuple[float, bool]]:
-    """CBC 기반 필터링 적용 (쿼리 단위 분포 기반) - 더 적극적 필터링"""
+    """CBC 기반 필터링 적용 (고정 임계값 0.95 수준의 높은 성능)"""
     cbc_threshold = cbc_threshold_per_query(scores)
-    # 더 적극적인 필터링을 위해 임계값을 높임
-    aggressive_threshold = max(cbc_threshold, 0.6)  # 최소 0.6 이상
+    # 고정 임계값 0.95 수준의 높은 성능을 위해 더 높은 임계값 사용
+    aggressive_threshold = max(cbc_threshold, 0.95)  # 최소 0.95 이상
     return [(float(score), score >= aggressive_threshold) for score in scores]
 
 # ===============================

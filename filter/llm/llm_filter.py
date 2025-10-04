@@ -467,6 +467,71 @@ def save_sde_cache(query: str, paraphrases: List[str], cache_dir: str):
 # ===============================
 # SDE (Semantic Data Expansion)
 # ===============================
+def log_sde_shift(original_scores, sde_scores, thr):
+    """SDE 효과를 수치로 측정하는 로깅 함수"""
+    import numpy as np
+    o = np.array(original_scores); s = np.array(sde_scores)
+    delta = s - o
+    # 1) 평균/표준편차
+    print(f"[SDE] Δmean={delta.mean():.4f}, Δstd={delta.std():.4f}")
+    # 2) 임계값 크로싱 수
+    cross_up = np.sum((o < thr) & (s >= thr))
+    cross_dn = np.sum((o >= thr) & (s < thr))
+    print(f"[SDE] crossings: up={cross_up}, down={cross_dn} @thr={thr:.2f}")
+    # 3) 코사인 유사도(순위보다는 점수 변화량 관찰)
+    cos = (o@s)/(np.linalg.norm(o)+1e-8)/(np.linalg.norm(s)+1e-8)
+    print(f"[SDE] cos(original, sde)={cos:.4f}")
+def diverse_enough(p, original):
+    """의미 다양성 검사"""
+    # 1) 레벤슈타인 유사도(낮을수록 OK)
+    import difflib
+    ratio = difflib.SequenceMatcher(a=p.lower(), b=original.lower()).ratio()
+    if ratio > 0.85:  # 너무 비슷하면 제외
+        return False
+    # 2) 토큰 Jaccard(겹치지 않을수록 OK)
+    s1, s2 = set(p.lower().split()), set(original.lower().split())
+    jacc = len(s1&s2)/max(1, len(s1|s2))
+    return jacc < 0.75
+
+def filter_paraphrases(paraphrases: List[str], original_query: str, max_count: int) -> List[str]:
+    """paraphrases 품질 필터링 (의미 다양성 추가)"""
+    seen = set()
+    out = []
+    original_words = len(original_query.split())
+    
+    for p in paraphrases:
+        p_l = p.lower().strip()
+        p_words = len(p.split())
+        
+        # 원본과 동일한지 확인
+        if p_l == original_query.lower().strip(): 
+            continue
+            
+        # 길이 필터 (±100% 범위로 완화)
+        if not (max(3, original_words * 0.5) <= p_words <= original_words * 2.0 + 2):
+            continue
+            
+        # 과도한 구체화 제거
+        if any(bad in p_l for bad in ["last fiscal year", "per day", "united states", "during the", "in the"]):
+            continue
+            
+        # 의미 다양성 검사 추가
+        if not diverse_enough(p, original_query):
+            continue
+            
+        # 중복 제거
+        if p_l in seen: 
+            continue
+            
+        seen.add(p_l)
+        out.append(p)
+        
+        # 최대 개수 제한
+        if len(out) >= max_count:
+            break
+            
+    return out
+
 def generate_anchors_ollama(client, model_name: str, query: str, num_anchors: int, config: LLMFilterConfig) -> List[str]:
     """s_filter.py와 동일한 방식으로 앵커 생성"""
     if num_anchors <= 0:
@@ -482,24 +547,23 @@ def generate_anchors_ollama(client, model_name: str, query: str, num_anchors: in
     
     print(f"🔄 [Cache] Generating {num_anchors} anchors for query: {query[:50]}...")
     
-    # Hard Negative 대비형 paraphrase 생성 프롬프트
+    # 차별화된 paraphrase 생성 프롬프트 (SDE 효과 증대)
     prompt = (
         f"Generate {num_anchors} paraphrases of: '{query}'\n"
-        f"Goal: Create variations that help distinguish relevant documents from irrelevant ones.\n"
+        f"Goal: Create semantically distinct variations that capture different aspects of the same information need.\n"
         f"\n"
         f"Rules:\n"
         f"1. Keep similar length (original ±30%)\n"
-        f"2. Vary structure/expression significantly\n"
-        f"3. Preserve core intent but use different perspectives\n"
-        f"4. Include domain-specific terms when appropriate\n"
-        f"5. Make each paraphrase semantically distinct\n"
+        f"2. Use COMPLETELY different word choices and structures\n"
+        f"3. Preserve core intent but approach from different angles\n"
+        f"4. Include domain-specific synonyms and technical terms\n"
+        f"5. Make each paraphrase as different as possible from the original\n"
         f"\n"
-        f"Strategy examples:\n"
-        f"- Direct variation: 'average Walgreens sales per store'\n"
-        f"- Synonym variation: 'typical revenue at Walgreens locations'\n"
-        f"- Structure variation: 'how much does a Walgreens store usually sell'\n"
-        f"- Statistical variation: 'median Walgreens store sales'\n"
-        f"- Temporal variation: 'Walgreens daily sales per store'\n"
+        f"Examples for '{query}':\n"
+        f"- Focus on different aspects: sales → revenue → income → earnings\n"
+        f"- Use different question structures: direct → indirect → descriptive\n"
+        f"- Vary specificity: general → specific → technical\n"
+        f"- Change perspective: store-level → company-level → industry-level\n"
         f"\n"
         f"Write only the paraphrases, one per line. No explanations.\n"
     )
@@ -510,23 +574,16 @@ def generate_anchors_ollama(client, model_name: str, query: str, num_anchors: in
     else:  # GeminiAPI
         response = client.generate(prompt)
     
-    # 응답 파싱 (s_filter.py와 동일)
-    anchors = [line.strip() for line in response.splitlines() if line.strip()]
-    anchors = anchors[:num_anchors]
+    # 응답 파싱 및 품질 필터링
+    anchors_raw = [line.strip() for line in response.splitlines() if line.strip()]
+    anchors = filter_paraphrases(anchors_raw, query, config.sde_k)
     
-    # 중복 제거
-    seen, uniq = set(), []
-    for a in anchors:
-        if a not in seen:
-            seen.add(a)
-            uniq.append(a)
-    
-    if uniq:
+    if anchors:
         # 캐시에 저장
-        save_sde_cache(query, uniq, config.cache_dir)
-        print(f"💾 [Cache] Saved {len(uniq)} paraphrases for query: {query[:50]}...")
-    
-    return uniq
+        save_sde_cache(query, anchors, config.cache_dir)
+        print(f"💾 [Cache] Saved {len(anchors)} paraphrases for query: {query[:50]}...")
+
+    return anchors
 
 # ===============================
 # SDE Cache (SDE paraphrases만 캐시)
@@ -589,6 +646,27 @@ def apply_cbc_filtering(scores: List[float], threshold: float = 0.5) -> List[Tup
 # ===============================
 # Metrics Calculation (s_filter.py 방식으로 수정)
 # ===============================
+def compute_drop_from_predictions(predictions: List[bool], ground_truth: List[int]) -> Dict[str, float]:
+    """predictions 기반으로 Drop 지표를 직접 계산"""
+    dropped = [i for i, keep in enumerate(predictions) if not keep]
+    dropped_pos = sum(1 for i in dropped if ground_truth[i] == 1)
+    dropped_neg = sum(1 for i in dropped if ground_truth[i] == 0)
+    total_neg = sum(1 for g in ground_truth if g == 0)
+
+    drop_precision = (dropped_neg / len(dropped)) if dropped else 0.0
+    drop_recall = (dropped_neg / total_neg) if total_neg else 0.0
+    drop_f1 = (2*drop_precision*drop_recall/(drop_precision+drop_recall)
+               if (drop_precision+drop_recall)>0 else 0.0)
+    
+    return {
+        "Dropped_Count": len(dropped), 
+        "Dropped_Positive_Count": dropped_pos,
+        "Dropped_Negative_Count": dropped_neg,
+        "Drop_Precision": drop_precision, 
+        "Drop_Recall": drop_recall, 
+        "Drop_F1": drop_f1
+    }
+
 def calculate_metrics(predictions: List[bool], ground_truth: List[int]) -> Dict[str, float]:
     """평가 메트릭 계산"""
     tp = sum(1 for p, g in zip(predictions, ground_truth) if p and g == 1)
@@ -730,57 +808,79 @@ def run_experiments_with_scores(data: List[Dict[str, Any]], all_scores: Dict[str
             else:
                 print(f"❌ 쿼리 점수가 비어있음: {query}")
                 continue
-        baseline_filter_metrics = compute_filtering_metrics_llm(
-            baseline_scores, candidate_pool, positive_docs, negative_docs, config.sim_threshold
-        )
+        # Baseline - predictions 기반으로 Drop 지표 계산
+        baseline_predictions = [score >= config.sim_threshold for score in baseline_scores]
+        baseline_filter_metrics = compute_drop_from_predictions(baseline_predictions, relevance_labels)
         experiment_results['experiments']['baseline'] = {
             'scores': baseline_scores,
             'filter_metrics': baseline_filter_metrics
         }
         
-        # 2. LLM + SDE (s_filter.py와 동일한 Max Pooling 방식)
-        all_query_scores = list(query_scores.values())
-        
+        # 2. LLM + SDE (차등 융합 방식)
         # 원본 쿼리 점수
         original_scores = baseline_scores
         
         # 앵커 점수들 (원본 제외)
-        anchor_scores = all_query_scores[1:] if len(all_query_scores) > 1 else []
+        anchor_scores = [scores for k, scores in query_scores.items() if k != query]
         
         if len(anchor_scores) > 0:
             # 개선된 Score Fusion 방식 (원본 + paraphrase 신호 합산)
             # 1단계: 앵커들 중 최고 점수
             anchor_max_scores = [np.max([scores[i] for scores in anchor_scores]) for i in range(len(original_scores))]
             
-            # 2단계: 가중 평균 Score Fusion (원본 60% + paraphrase 40%)
-            # 이렇게 하면 paraphrase가 원본보다 낮아도 전체적인 신호 강화 효과
-            sde_final_scores = [0.6 * original_scores[i] + 0.4 * anchor_max_scores[i] for i in range(len(original_scores))]
+            # 2단계: 차등 융합 + 경계 민감도 방식 (Threshold-aware Boost)
+            alpha = 0.7  # 원본 비중
+            beta = 0.3   # 앵커 비중
+            margin = 0.05  # 앵커 승리시 추가 보너스
+            thr = config.sim_threshold
+            band = 0.05  # 경계 주변 밴드
+            
+            sde_final_scores = []
+            for i in range(len(original_scores)):
+                fused = alpha * original_scores[i] + beta * anchor_max_scores[i]
+                
+                # A. 경계 민감 가중치(Threshold-aware Boost)
+                if abs(original_scores[i] - thr) <= band and (anchor_max_scores[i] - original_scores[i]) > 0.01:
+                    fused = min(1.0, fused + 0.07)  # 경계 근처만 강하게 밀어줌
+                
+                # B. 앵커 우승 "확실성" 보너스(Top-2 margin)
+                anchor_sorted = sorted([scores[i] for scores in anchor_scores], reverse=True)
+                margin_top2 = anchor_sorted[0] - (anchor_sorted[1] if len(anchor_sorted) > 1 else 0.0)
+                if anchor_max_scores[i] > original_scores[i] + 0.02 and margin_top2 > 0.03:
+                    fused = min(1.0, fused + 0.05)
+                
+                sde_final_scores.append(fused)
         else:
             sde_final_scores = original_scores
         
-        sde_filter_metrics = compute_filtering_metrics_llm(
-            sde_final_scores, candidate_pool, positive_docs, negative_docs, config.sim_threshold
-        )
+        # SDE 효과 로깅
+        log_sde_shift(original_scores, sde_final_scores, config.sim_threshold)
+        
+        # SDE - predictions 기반으로 Drop 지표 계산
+        sde_predictions = [score >= config.sim_threshold for score in sde_final_scores]
+        sde_filter_metrics = compute_drop_from_predictions(sde_predictions, relevance_labels)
         experiment_results['experiments']['sde'] = {
             'scores': sde_final_scores,
             'filter_metrics': sde_filter_metrics
         }
         
-        # 3. LLM + CBC (개선된 적응적 임계값)
-        cbc_threshold = cbc_stats.get_adaptive_threshold('overlap') if cbc_stats.stats['overlap'] else config.sim_threshold
-        cbc_filter_metrics = compute_filtering_metrics_llm(
-            baseline_scores, candidate_pool, positive_docs, negative_docs, cbc_threshold
-        )
+        # 3. LLM + CBC (쿼리별 분포 기반 임계값)
+        cbc_threshold = max(cbc_threshold_per_query(baseline_scores), 0.6)
+        # CBC - predictions 기반으로 Drop 지표 계산
+        cbc_predictions = [score >= cbc_threshold for score in baseline_scores]
+        cbc_filter_metrics = compute_drop_from_predictions(cbc_predictions, relevance_labels)
         experiment_results['experiments']['cbc'] = {
             'scores': baseline_scores,
             'filter_metrics': cbc_filter_metrics
         }
         
-        # 4. LLM + SDE + CBC (CBC 시너지 최적화된 조합)
-        # SDE의 다양한 관점과 CBC의 분포 기반 임계값을 결합
-        sde_cbc_filter_metrics = compute_filtering_metrics_llm(
-            sde_final_scores, candidate_pool, positive_docs, negative_docs, cbc_threshold
-        )
+        # 4. LLM + SDE + CBC (SDE 점수 분포 기반 CBC 임계값)
+        sde_cbc_threshold = max(cbc_threshold_per_query(sde_final_scores), 0.6)
+        # SDE+CBC 효과 로깅
+        log_sde_shift(original_scores, sde_final_scores, sde_cbc_threshold)
+        # SDE+CBC - predictions 기반으로 Drop 지표 계산
+        sde_cbc_predictions = [score >= sde_cbc_threshold for score in sde_final_scores]
+        sde_cbc_filter_metrics = compute_drop_from_predictions(sde_cbc_predictions, relevance_labels)
         experiment_results['experiments']['sde_cbc'] = {
             'scores': sde_final_scores,
             'filter_metrics': sde_cbc_filter_metrics
@@ -958,8 +1058,17 @@ def run_llm_sde_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
             # 앵커들 중 최고 점수
             anchor_max_scores = [np.max([s[i] for s in anchor_scores]) for i in range(len(passages))]
             
-            # 가중 평균 Score Fusion (원본 60% + paraphrase 40%)
-            agg_scores = [0.6 * original_scores[i] + 0.4 * anchor_max_scores[i] for i in range(len(passages))]
+            # 차등 융합 + 경계 민감도 방식
+            alpha = 0.7  # 원본 비중
+            beta = 0.3   # 앵커 비중
+            margin = 0.05  # 앵커 승리시 추가 보너스
+            
+            agg_scores = []
+            for i in range(len(passages)):
+                fused = alpha * original_scores[i] + beta * anchor_max_scores[i]
+                if anchor_max_scores[i] > original_scores[i] + 0.02:  # 앵커가 의미 있게 우위일 때
+                    fused = min(1.0, fused + margin)
+                agg_scores.append(fused)
         else:
             agg_scores = original_scores
 
@@ -984,7 +1093,6 @@ def run_llm_sde_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
         results.append({
             'query': query,
             'anchors': anchors,
-            'all_scores': all_scores,
             'agg_scores': agg_scores,
             'predictions': predictions,
             'ground_truth': ground_truth,
@@ -1068,14 +1176,8 @@ def run_llm_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConfig) 
         # 메트릭 계산
         metrics = calculate_metrics(predictions, ground_truth)
         
-        # Drop 메트릭 계산
-        candidate_pool = list(range(len(passages)))
-        positive_docs = [i for i, v in enumerate(ground_truth) if v == 1]
-        negative_docs = [i for i, v in enumerate(ground_truth) if v == 0]
-        
-        drop_metrics = compute_filtering_metrics_llm(
-            scores, candidate_pool, positive_docs, negative_docs, config.sim_threshold
-        )
+        # Drop 메트릭 계산 (실제 CBC predictions 사용)
+        drop_metrics = compute_drop_from_predictions(predictions, ground_truth)
         
         results.append({
             'query': query,
@@ -1157,8 +1259,17 @@ def run_llm_sde_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConf
             # 앵커들 중 최고 점수
             anchor_max_scores = [np.max([s[i] for s in anchor_scores]) for i in range(len(passages))]
             
-            # 가중 평균 Score Fusion (원본 60% + paraphrase 40%)
-            avg_scores = [0.6 * original_scores[i] + 0.4 * anchor_max_scores[i] for i in range(len(passages))]
+            # 차등 융합 + 경계 민감도 방식
+            alpha = 0.7  # 원본 비중
+            beta = 0.3   # 앵커 비중
+            margin = 0.05  # 앵커 승리시 추가 보너스
+            
+            avg_scores = []
+            for i in range(len(passages)):
+                fused = alpha * original_scores[i] + beta * anchor_max_scores[i]
+                if anchor_max_scores[i] > original_scores[i] + 0.02:  # 앵커가 의미 있게 우위일 때
+                    fused = min(1.0, fused + margin)
+                avg_scores.append(fused)
         else:
             avg_scores = original_scores
         
@@ -1193,7 +1304,6 @@ def run_llm_sde_cbc_experiment(data: List[Dict[str, Any]], config: LLMFilterConf
         results.append({
             'query': query,
             'anchors': anchors,
-            'all_scores': all_scores,
             'avg_scores': avg_scores,
             'cbc_results': cbc_results,
             'predictions': predictions,

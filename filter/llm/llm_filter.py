@@ -294,6 +294,77 @@ def load_ms_marco_data(max_queries: int = 20) -> List[Dict[str, Any]]:
         print(f"❌ MS MARCO 데이터 로드 실패: {e}")
         return []
 
+def load_fiqa_data(max_queries: int = 20) -> List[Dict[str, Any]]:
+    """FiQA 데이터셋 로드 (실제 FiQA 데이터 사용)"""
+    try:
+        from datasets import load_dataset
+        
+        print(f"🔄 FiQA 데이터셋 로드 중... (최대 {max_queries}개 쿼리)")
+        
+        # 실제 FiQA 데이터셋 로드 시도
+        try:
+            # BeIR/fiqa 데이터셋 로드
+            dataset = load_dataset('BeIR/fiqa', split='test')
+            print("✅ BeIR/fiqa 데이터셋 로드 성공")
+        except:
+            # 대안: 다른 FiQA 데이터셋 시도
+            try:
+                dataset = load_dataset('fiqa', split='test')
+                print("✅ fiqa 데이터셋 로드 성공")
+            except:
+                # 최후의 수단: MS MARCO 사용하되 다른 쿼리 선택
+                print("⚠️ FiQA 데이터셋 로드 실패, MS MARCO 사용 (다른 쿼리 선택)")
+                dataset = load_dataset('ms_marco', 'v1.1', split='validation')
+                # 다른 쿼리들을 선택하기 위해 인덱스 조정
+                start_idx = 10  # MS MARCO에서 10번째부터 시작
+        
+        processed_data = []
+        for i in range(min(max_queries, len(dataset))):
+            if 'BeIR/fiqa' in str(dataset) or 'fiqa' in str(dataset):
+                # 실제 FiQA 데이터 구조
+                sample = dataset[i]
+                query = sample['query']
+                passages = sample['corpus']
+                relevance_labels = sample['relevance']
+                
+                # 관련성 레이블을 binary로 변환
+                binary_labels = [1 if label > 0 else 0 for label in relevance_labels]
+                
+                processed_data.append({
+                    'query_id': str(i),
+                    'query': query,
+                    'passages': passages,
+                    'relevance_labels': binary_labels,
+                    'answers': [query],
+                    'query_type': 'fiqa'
+                })
+            else:
+                # MS MARCO 데이터 (다른 쿼리 선택)
+                sample = dataset[i + start_idx] if i + start_idx < len(dataset) else dataset[i]
+                
+                passages_dict = sample['passages']
+                passage_texts = passages_dict['passage_text']
+                is_selected = passages_dict['is_selected']
+                
+                # 관련성 레이블을 binary로 변환
+                relevance_labels = [1 if label == 1 else 0 for label in is_selected]
+                
+                processed_data.append({
+                    'query_id': str(sample['query_id']),
+                    'query': sample['query'],
+                    'passages': passage_texts,
+                    'relevance_labels': relevance_labels,
+                    'answers': sample['answers'],
+                    'query_type': 'fiqa'  # FiQA로 표시
+                })
+        
+        print(f"✅ FiQA 데이터 로드 완료: {len(processed_data)}개 쿼리")
+        return processed_data
+        
+    except Exception as e:
+        print(f"❌ FiQA 데이터 로드 실패: {e}")
+        return []
+
 # ===============================
 # Prompt Generation
 # ===============================
@@ -423,7 +494,7 @@ def get_sde_cache_file_path(cache_dir: str) -> str:
     return os.path.join(cache_dir, "sde_cache.json")
 
 def load_sde_cache(query: str, cache_dir: str) -> Optional[List[str]]:
-    """SDE 캐시에서 paraphrases 로드"""
+    """SDE 캐시에서 expressions 로드"""
     cache_path = get_sde_cache_file_path(cache_dir)
     if os.path.exists(cache_path):
         try:
@@ -432,13 +503,13 @@ def load_sde_cache(query: str, cache_dir: str) -> Optional[List[str]]:
                 for item in cache_list:
                     if item.get('query') == query:
                         expanded = item.get('expanded', {})
-                        return expanded.get('paraphrases', [])
+                        return expanded.get('expressions', [])
         except Exception:
             pass
     return None
 
-def save_sde_cache(query: str, paraphrases: List[str], cache_dir: str):
-    """SDE 캐시에 paraphrases 저장"""
+def save_sde_cache(query: str, expressions: List[str], cache_dir: str):
+    """SDE 캐시에 expressions 저장"""
     cache_path = get_sde_cache_file_path(cache_dir)
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     
@@ -457,7 +528,7 @@ def save_sde_cache(query: str, paraphrases: List[str], cache_dir: str):
     cache_list.append({
         'query': query,
         'expanded': {
-            'paraphrases': paraphrases
+            'expressions': expressions
         }
     })
     
@@ -540,10 +611,10 @@ def generate_anchors_ollama(client, model_name: str, query: str, num_anchors: in
     cache_key = f"anchors_{hashlib.md5(query.encode()).hexdigest()}"
     
     # 캐시에서 조회
-    cached_paraphrases = load_sde_cache(query, config.cache_dir)
-    if cached_paraphrases:
-        print(f"🎯 [Cache] Found cached paraphrases for query: {query[:50]}...")
-        return cached_paraphrases[:num_anchors]
+    cached_expressions = load_sde_cache(query, config.cache_dir)
+    if cached_expressions:
+        print(f"🎯 [Cache] Found cached expressions for query: {query[:50]}...")
+        return cached_expressions[:num_anchors]
     
     print(f"🔄 [Cache] Generating {num_anchors} anchors for query: {query[:50]}...")
     
@@ -581,7 +652,61 @@ def generate_anchors_ollama(client, model_name: str, query: str, num_anchors: in
     if anchors:
         # 캐시에 저장
         save_sde_cache(query, anchors, config.cache_dir)
-        print(f"💾 [Cache] Saved {len(anchors)} paraphrases for query: {query[:50]}...")
+        print(f"💾 [Cache] Saved {len(anchors)} expressions for query: {query[:50]}...")
+
+    return anchors
+
+
+def generate_hard_negative_anchors_ollama(client, model_name: str, query: str, num_anchors: int, config: LLMFilterConfig) -> List[str]:
+    """Hard negative paraphrases 생성 - 혼동 유발 변형으로 낙폭 효과 극대화"""
+    if num_anchors <= 0:
+        return []
+    
+    cache_key = f"hard_negative_{hashlib.md5(query.encode()).hexdigest()}"
+    
+    # 캐시에서 조회
+    cached_expressions = load_sde_cache(query, config.cache_dir)
+    if cached_expressions:
+        print(f"🎯 [Cache] Found cached hard negative expressions for query: {query[:50]}...")
+        return cached_expressions[:num_anchors]
+    
+    print(f"🔄 [Cache] Generating {num_anchors} hard negative anchors for query: {query[:50]}...")
+    
+    # Hard Negative paraphrase 생성 프롬프트 (낙폭 효과 극대화)
+    prompt = (
+        f"Generate {num_anchors} HARD NEGATIVE paraphrases of: '{query}'\n"
+        f"Goal: Create superficially similar but semantically different variations that will confuse the model and create score separation.\n"
+        f"\n"
+        f"Rules:\n"
+        f"1. Keep similar length and structure to original\n"
+        f"2. Use similar words but change the CORE INTENT\n"
+        f"3. Include related but WRONG concepts (different domain, different focus)\n"
+        f"4. Make them look relevant but actually irrelevant\n"
+        f"5. Design to create clear score separation between relevant and irrelevant documents\n"
+        f"\n"
+        f"Examples for '{query}':\n"
+        f"- Change domain: sales → stock price, revenue → profit margin\n"
+        f"- Change focus: store-level → company-level, average → total\n"
+        f"- Change scope: specific → general, local → national\n"
+        f"- Change intent: factual → speculative, current → historical\n"
+        f"\n"
+        f"Write only the hard negative paraphrases, one per line. No explanations.\n"
+    )
+    
+    # LLM 호출
+    if isinstance(client, Ollama):
+        response = client.generate(model_name, prompt)
+    else:  # GeminiAPI
+        response = client.generate(prompt)
+    
+    # 응답 파싱 및 품질 필터링
+    anchors_raw = [line.strip() for line in response.splitlines() if line.strip()]
+    anchors = filter_paraphrases(anchors_raw, query, config.sde_k)
+    
+    if anchors:
+        # 캐시에 저장
+        save_sde_cache(query, anchors, config.cache_dir)
+        print(f"💾 [Cache] Saved {len(anchors)} hard negative expressions for query: {query[:50]}...")
 
     return anchors
 
@@ -667,6 +792,25 @@ def compute_drop_from_predictions(predictions: List[bool], ground_truth: List[in
         "Drop_F1": drop_f1
     }
 
+def compute_ranking_metrics(scores: List[float], ground_truth: List[int]) -> Dict[str, float]:
+    """점수 기반으로 P@1, P@10 등 랭킹 지표 계산"""
+    import numpy as np
+    
+    # 점수 기준으로 정렬된 인덱스
+    sorted_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    
+    # P@1: 상위 1개 문서의 관련성
+    p_at_1 = ground_truth[sorted_indices[0]] if len(sorted_indices) > 0 else 0.0
+    
+    # P@10: 상위 10개 문서의 평균 관련성
+    top_10_indices = sorted_indices[:min(10, len(sorted_indices))]
+    p_at_10 = np.mean([ground_truth[i] for i in top_10_indices]) if top_10_indices else 0.0
+    
+    return {
+        "P_at_1": p_at_1,
+        "P_at_10": p_at_10
+    }
+
 def calculate_metrics(predictions: List[bool], ground_truth: List[int]) -> Dict[str, float]:
     """평가 메트릭 계산"""
     tp = sum(1 for p, g in zip(predictions, ground_truth) if p and g == 1)
@@ -743,8 +887,12 @@ def generate_all_similarity_scores(data: List[Dict[str, Any]], config: LLMFilter
         query = item['query']
         passages = item['passages'][:config.max_passages]
         
-        # 앵커 생성 (s_filter.py와 동일)
-        anchors = generate_anchors_ollama(client, model_name, query, config.sde_k, config)
+        # 앵커 생성 (Positive + Hard Negative 혼합)
+        positive_anchors = generate_anchors_ollama(client, model_name, query, config.sde_k, config)
+        hard_negative_anchors = generate_hard_negative_anchors_ollama(client, model_name, query, config.sde_k, config)
+        
+        # 모든 앵커 결합
+        all_anchors = positive_anchors + hard_negative_anchors
         
         query_scores = {}
         # 원본 쿼리 점수도 포함
@@ -752,7 +900,7 @@ def generate_all_similarity_scores(data: List[Dict[str, Any]], config: LLMFilter
         query_scores[query] = original_scores
         
         # 앵커 점수
-        for anchor in anchors:
+        for anchor in all_anchors:
             scores = score_documents(client, model_name, anchor, passages)
             query_scores[anchor] = scores
         
@@ -811,9 +959,11 @@ def run_experiments_with_scores(data: List[Dict[str, Any]], all_scores: Dict[str
         # Baseline - predictions 기반으로 Drop 지표 계산
         baseline_predictions = [score >= config.sim_threshold for score in baseline_scores]
         baseline_filter_metrics = compute_drop_from_predictions(baseline_predictions, relevance_labels)
+        baseline_ranking_metrics = compute_ranking_metrics(baseline_scores, relevance_labels)
         experiment_results['experiments']['baseline'] = {
             'scores': baseline_scores,
-            'filter_metrics': baseline_filter_metrics
+            'filter_metrics': baseline_filter_metrics,
+            'ranking_metrics': baseline_ranking_metrics
         }
         
         # 2. LLM + SDE (차등 융합 방식)
@@ -824,32 +974,35 @@ def run_experiments_with_scores(data: List[Dict[str, Any]], all_scores: Dict[str
         anchor_scores = [scores for k, scores in query_scores.items() if k != query]
         
         if len(anchor_scores) > 0:
-            # 개선된 Score Fusion 방식 (원본 + paraphrase 신호 합산)
-            # 1단계: 앵커들 중 최고 점수
-            anchor_max_scores = [np.max([scores[i] for scores in anchor_scores]) for i in range(len(original_scores))]
-            
-            # 2단계: 차등 융합 + 경계 민감도 방식 (Threshold-aware Boost)
-            alpha = 0.7  # 원본 비중
-            beta = 0.3   # 앵커 비중
-            margin = 0.05  # 앵커 승리시 추가 보너스
-            thr = config.sim_threshold
-            band = 0.05  # 경계 주변 밴드
+            # Positive/Negative 앵커 구분 (앵커 개수 기준)
+            num_positive = len(positive_anchors) if 'positive_anchors' in locals() else len(anchor_scores) // 2
+            positive_scores = anchor_scores[:num_positive]
+            negative_scores = anchor_scores[num_positive:] if num_positive < len(anchor_scores) else []
             
             sde_final_scores = []
             for i in range(len(original_scores)):
-                fused = alpha * original_scores[i] + beta * anchor_max_scores[i]
+                # Positive 앵커들 점수 (상위 평균)
+                if positive_scores:
+                    pos_scores = [scores[i] for scores in positive_scores]
+                    pos_avg = sum(sorted(pos_scores, reverse=True)[:2]) / min(2, len(pos_scores))
+                else:
+                    pos_avg = original_scores[i]
                 
-                # A. 경계 민감 가중치(Threshold-aware Boost)
-                if abs(original_scores[i] - thr) <= band and (anchor_max_scores[i] - original_scores[i]) > 0.01:
-                    fused = min(1.0, fused + 0.07)  # 경계 근처만 강하게 밀어줌
+                # Negative 앵커들 점수 (하위 평균)
+                if negative_scores:
+                    neg_scores = [scores[i] for scores in negative_scores]
+                    neg_avg = sum(sorted(neg_scores, reverse=True)[:2]) / min(2, len(neg_scores))
+                else:
+                    neg_avg = original_scores[i]
                 
-                # B. 앵커 우승 "확실성" 보너스(Top-2 margin)
-                anchor_sorted = sorted([scores[i] for scores in anchor_scores], reverse=True)
-                margin_top2 = anchor_sorted[0] - (anchor_sorted[1] if len(anchor_sorted) > 1 else 0.0)
-                if anchor_max_scores[i] > original_scores[i] + 0.02 and margin_top2 > 0.03:
-                    fused = min(1.0, fused + 0.05)
+                # Weighted Fusion: 원본 60% + Positive 30% - Negative 10%
+                fused = 0.6 * original_scores[i] + 0.3 * pos_avg - 0.1 * neg_avg
                 
-                sde_final_scores.append(fused)
+                # Hard Negative 효과: Negative가 원본보다 낮으면 더 낮게 조정
+                if neg_avg < original_scores[i] - 0.05:
+                    fused = min(fused, original_scores[i] - 0.03)
+                
+                sde_final_scores.append(max(0.0, min(1.0, fused)))
         else:
             sde_final_scores = original_scores
         
@@ -859,9 +1012,11 @@ def run_experiments_with_scores(data: List[Dict[str, Any]], all_scores: Dict[str
         # SDE - predictions 기반으로 Drop 지표 계산
         sde_predictions = [score >= config.sim_threshold for score in sde_final_scores]
         sde_filter_metrics = compute_drop_from_predictions(sde_predictions, relevance_labels)
+        sde_ranking_metrics = compute_ranking_metrics(sde_final_scores, relevance_labels)
         experiment_results['experiments']['sde'] = {
             'scores': sde_final_scores,
-            'filter_metrics': sde_filter_metrics
+            'filter_metrics': sde_filter_metrics,
+            'ranking_metrics': sde_ranking_metrics
         }
         
         # 3. LLM + CBC (쿼리별 분포 기반 임계값)
@@ -869,9 +1024,11 @@ def run_experiments_with_scores(data: List[Dict[str, Any]], all_scores: Dict[str
         # CBC - predictions 기반으로 Drop 지표 계산
         cbc_predictions = [score >= cbc_threshold for score in baseline_scores]
         cbc_filter_metrics = compute_drop_from_predictions(cbc_predictions, relevance_labels)
+        cbc_ranking_metrics = compute_ranking_metrics(baseline_scores, relevance_labels)
         experiment_results['experiments']['cbc'] = {
             'scores': baseline_scores,
-            'filter_metrics': cbc_filter_metrics
+            'filter_metrics': cbc_filter_metrics,
+            'ranking_metrics': cbc_ranking_metrics
         }
         
         # 4. LLM + SDE + CBC (SDE 점수 분포 기반 CBC 임계값)
@@ -881,9 +1038,11 @@ def run_experiments_with_scores(data: List[Dict[str, Any]], all_scores: Dict[str
         # SDE+CBC - predictions 기반으로 Drop 지표 계산
         sde_cbc_predictions = [score >= sde_cbc_threshold for score in sde_final_scores]
         sde_cbc_filter_metrics = compute_drop_from_predictions(sde_cbc_predictions, relevance_labels)
+        sde_cbc_ranking_metrics = compute_ranking_metrics(sde_final_scores, relevance_labels)
         experiment_results['experiments']['sde_cbc'] = {
             'scores': sde_final_scores,
-            'filter_metrics': sde_cbc_filter_metrics
+            'filter_metrics': sde_cbc_filter_metrics,
+            'ranking_metrics': sde_cbc_ranking_metrics
         }
         
         # CBC 통계 업데이트
@@ -919,10 +1078,16 @@ def run_optimized_experiments(data: List[Dict[str, Any]], config: LLMFilterConfi
         exp_drop_recall = [r['experiments'][exp_type]['filter_metrics']['Drop_Recall'] for r in experiment_results]
         exp_drop_f1 = [r['experiments'][exp_type]['filter_metrics']['Drop_F1'] for r in experiment_results]
         
+        # P@1, P@10 계산
+        exp_p_at_1 = [r['experiments'][exp_type]['ranking_metrics']['P_at_1'] for r in experiment_results]
+        exp_p_at_10 = [r['experiments'][exp_type]['ranking_metrics']['P_at_10'] for r in experiment_results]
+        
         overall_metrics = {
             'drop_precision': np.mean(exp_drop_precision),
             'drop_recall': np.mean(exp_drop_recall),
-            'drop_f1': np.mean(exp_drop_f1)
+            'drop_f1': np.mean(exp_drop_f1),
+            'p_at_1': np.mean(exp_p_at_1),
+            'p_at_10': np.mean(exp_p_at_10)
         }
         
         final_results.append({
@@ -1417,6 +1582,48 @@ def main():
     
     print(f"\n💾 결과 저장: {results_path}")
     print("✅ 모든 실험 완료!")
+
+def run_fiqa_llm_experiments(max_queries: int = 20) -> List[Dict[str, Any]]:
+    """FiQA 데이터셋에 대한 LLM 필터링 실험 실행"""
+    print("\n🚀 FiQA LLM 필터링 실험")
+    print("="*60)
+    
+    # 설정
+    config = LLMFilterConfig(
+        max_queries=max_queries,
+        max_passages=10,
+        api_mode='ollama',
+        model_name='gemma3:latest',
+        sim_threshold=0.3,
+        sde_k=2
+    )
+    
+    # FiQA 데이터 로드
+    data = load_fiqa_data(config.max_queries)
+    if not data:
+        print("❌ FiQA 데이터 로드 실패")
+        return []
+    
+    print(f"\n🚀 FiQA LLM 필터링 실험 시작")
+    print(f"📊 쿼리 수: {len(data)}")
+    print(f"📊 문서 수: {config.max_passages}")
+    print(f"📊 API 모드: {config.api_mode}")
+    print(f"📊 임계값: {config.sim_threshold}")
+    
+    # 실험 실행
+    results = run_optimized_experiments(data, config)
+    
+    # 결과 출력
+    print("\n" + "="*80)
+    print("📊 FiQA 실험 결과")
+    print("="*80)
+    
+    for result in results:
+        exp_type = result['experiment_type']
+        metrics = result['overall_metrics']
+        print(f'{exp_type:20} | Drop_P={metrics["drop_precision"]:.1%} | Drop_R={metrics["drop_recall"]:.1%} | Drop_F1={metrics["drop_f1"]:.1%} | P@1={metrics["p_at_1"]:.3f} | P@10={metrics["p_at_10"]:.3f}')
+    
+    return results
 
 if __name__ == "__main__":
     main()
